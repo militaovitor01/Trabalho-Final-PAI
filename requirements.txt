@@ -1,0 +1,7 @@
+customtkinter
+Pillow
+numpy
+scipy
+torch
+torchvision
+ruff
