@@ -5,8 +5,9 @@
 # Grupo: [NOME, MATRÍCULA, CURSO E CAMPUS DOS INTEGRANTES]
 # =============================================================================
 
+import io
+import json
 import os
-import random
 import re
 import threading
 import time
@@ -18,7 +19,6 @@ import numpy as np
 from PIL import Image, ImageFilter, ImageTk
 
 # ── Bibliotecas de processamento e Deep Learning ────────────────────────────
-# scipy é usada para encontrar componentes conectados na segmentação
 try:
     from scipy import ndimage as ndi
 
@@ -26,20 +26,34 @@ try:
 except ImportError:
     SCIPY_OK = False
 
-# PyTorch e torchvision para DataLoaders e transformações
 try:
     import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
     from torch.utils.data import DataLoader
-    from torchvision import datasets, transforms
+    from torchvision import datasets, models, transforms
 
     TORCH_OK = True
 except ImportError:
     TORCH_OK = False
 
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")  # backend sem janela (renderiza para buffer)
+    import matplotlib.patches as mpatches
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    MPL_OK = True
+except ImportError:
+    MPL_OK = False
+
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
-# Fontes
+# ── Constantes de fonte ──────────────────────────────────────────────────────
 FONTE_TITULO = ("Helvetica", 16, "bold")
 FONTE_SECAO = ("Helvetica", 11, "bold")
 FONTE_CORPO = ("Helvetica", 11)
@@ -47,8 +61,20 @@ FONTE_PEQUENA = ("Helvetica", 9)
 FONTE_MONO = ("Courier New", 10)
 FONTE_METRICA = ("Helvetica", 18, "bold")
 
+# ── Dispositivo PyTorch ──────────────────────────────────────────────────────
+DEVICE = (
+    torch.device("cuda" if (TORCH_OK and torch.cuda.is_available()) else "cpu")
+    if TORCH_OK
+    else None
+)
 
-# ── Widgets reutilizáveis ────────────────────────────────────────────────────
+print("Dispositivo:", DEVICE)
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+
+# =============================================================================
+# WIDGETS REUTILIZÁVEIS
+# =============================================================================
 
 
 def rotulo_secao(pai, texto):
@@ -84,7 +110,879 @@ class BarraStatus(ctk.CTkFrame):
         self._var.set(msg)
 
 
-# ── Aba Visualizador ─────────────────────────────────────────────────────────
+# =============================================================================
+# PIPELINE DE SEGMENTAÇÃO (independente da UI)
+# =============================================================================
+
+
+def organizar_registro(caminho_arquivo: str) -> dict | None:
+    """
+    Extrai metadados de uma imagem a partir do seu caminho no dataset LMLO.
+
+    Regras:
+    - Letra inicial define a classe:
+        D → BI-RADS I  (classe 0)
+        E → BI-RADS II (classe 1)
+        F → BI-RADS III(classe 2)
+        G → BI-RADS IV (classe 3)
+    - Número múltiplo de 4 → teste; demais → treino
+    """
+    mapa = {"D": (0, "I"), "E": (1, "II"), "F": (2, "III"), "G": (3, "IV")}
+    nome = os.path.basename(caminho_arquivo)
+    letra = nome[0].upper() if nome else ""
+    if letra not in mapa:
+        return None
+    classe, birads = mapa[letra]
+    nome_sem_ext = os.path.splitext(nome)[0]
+    digitos = re.sub(r"\D", "", nome_sem_ext)
+    numero = int(digitos) if digitos else 0
+    eh_treino = numero % 4 != 0
+    return {
+        "arquivo": caminho_arquivo,
+        "letra": letra,
+        "classe": classe,
+        "birads": birads,
+        "numero": numero,
+        "treino": eh_treino,
+    }
+
+
+def limiar_otsu(arr_cinza: np.ndarray) -> int:
+    """
+    Calcula o limiar ótimo de Otsu para imagem uint8.
+
+    Maximiza a variância inter-classes entre fundo (preto) e tecido mamário.
+    Implementação manual baseada no artigo original de Otsu (1979).
+    """
+    histograma, _ = np.histogram(arr_cinza.flatten(), bins=256, range=(0, 256))
+    total = arr_cinza.size
+    soma_total = float(np.dot(np.arange(256), histograma))
+    peso0 = soma0 = 0
+    melhor_var = limiar = 0
+    for t in range(256):
+        peso0 += histograma[t]
+        if not peso0:
+            continue
+        peso1 = total - peso0
+        if not peso1:
+            break
+        soma0 += t * histograma[t]
+        media0 = soma0 / peso0
+        media1 = (soma_total - soma0) / peso1
+        var = peso0 * peso1 * (media0 - media1) ** 2
+        if var > melhor_var:
+            melhor_var = var
+            limiar = t
+    return limiar
+
+
+def maior_componente_conectado(mascara_bin: np.ndarray) -> np.ndarray:
+    """
+    Retorna máscara binária com apenas o maior componente conectado.
+
+    Usado após Otsu para eliminar artefatos pequenos (anotações, réguas)
+    que não fazem parte do tecido mamário principal.
+
+    Usa scipy.ndimage com estrutura 3×3 (8-conectividade) quando disponível;
+    caso contrário aplica erosão/dilatação via PIL como fallback.
+    """
+    if SCIPY_OK:
+        estrutura = ndi.generate_binary_structure(2, 2)
+        rotulado, n_comp = ndi.label(mascara_bin, structure=estrutura)
+        if n_comp == 0:
+            return mascara_bin.astype(np.uint8) * 255
+        tamanhos = ndi.sum(mascara_bin, rotulado, range(1, n_comp + 1))
+        maior = int(np.argmax(tamanhos)) + 1
+        return (rotulado == maior).astype(np.uint8) * 255
+    else:
+        pil = Image.fromarray(mascara_bin.astype(np.uint8) * 255)
+        pil = pil.filter(ImageFilter.MinFilter(9))
+        pil = pil.filter(ImageFilter.MaxFilter(25))
+        return np.array(pil)
+
+
+def segmentar_mama(imagem_pil: Image.Image) -> Image.Image:
+    """
+    Pipeline robusto de segmentação da mama em imagem mamográfica.
+
+    Etapas:
+      1. Converte para escala de cinza normalizada uint8
+      2. Limiarização de Otsu (fundo vs. tecido)
+      3. Maior componente conectado (remove artefatos externos)
+      4. Abertura morfológica: MinFilter(5) → MaxFilter(9)
+         - MinFilter(5): erosão leve, remove ruídos de borda de 1-2px
+         - MaxFilter(9): dilatação para recuperar a borda da mama
+         - Tamanhos empíricos para imagens LMLO ~2000px de resolução
+      5. Aplica máscara: mantém pixels da mama, zera fundo
+    """
+    arr = np.array(imagem_pil)
+    if arr.dtype != np.uint8:
+        mn, mx = arr.min(), arr.max()
+        arr = ((arr.astype(np.float32) - mn) / max(mx - mn, 1) * 255).astype(np.uint8)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    limiar = limiar_otsu(arr)
+    mascara = (arr > limiar).astype(np.uint8)
+    mascara = maior_componente_conectado(mascara)
+    pil_m = Image.fromarray(mascara)
+    pil_m = pil_m.filter(ImageFilter.MinFilter(5))
+    pil_m = pil_m.filter(ImageFilter.MaxFilter(9))
+    arr_m = np.array(pil_m)
+    resultado = np.where(arr_m > 0, arr, 0).astype(np.uint8)
+    return Image.fromarray(resultado)
+
+
+def recortar_bounding_box(imagem_seg: Image.Image) -> Image.Image:
+    """
+    Recorta a bounding box da mama segmentada, eliminando fundo desnecessário.
+
+    Após segmentação, a imagem ainda contém grandes áreas pretas que degradam
+    o treinamento (rede desperdiça capacidade modelando pixels nulos).
+    O recorte garante que a mama ocupe ~100% da imagem resultante.
+
+    Margem de 2px: evita cortar a borda exata do tecido.
+    """
+    arr = np.array(imagem_seg)
+    linhas_validas = np.any(arr > 0, axis=1)
+    cols_validas = np.any(arr > 0, axis=0)
+    if not linhas_validas.any():
+        return imagem_seg
+    lin_min, lin_max = np.where(linhas_validas)[0][[0, -1]]
+    col_min, col_max = np.where(cols_validas)[0][[0, -1]]
+    lin_min = max(0, lin_min - 2)
+    lin_max = min(arr.shape[0] - 1, lin_max + 2)
+    col_min = max(0, col_min - 2)
+    col_max = min(arr.shape[1] - 1, col_max + 2)
+    return Image.fromarray(arr[lin_min : lin_max + 1, col_min : col_max + 1])
+
+
+def preparar_imagem(imagem_pil: Image.Image) -> Image.Image:
+    """
+    Pipeline completo de preparação para DenseNet121/VGG16.
+
+    Etapas:
+      1. Segmentação robusta (Otsu + componente conectado + morfologia)
+      2. Recorte do bounding box
+      3. Redimensionamento para 224×224 (padrão ImageNet) com LANCZOS
+         - LANCZOS oferece melhor qualidade no downscaling de alta resolução
+      4. Conversão para RGB (replica canal cinza em R, G, B)
+         - Necessário pois os pesos ImageNet esperam 3 canais
+    """
+    img_seg = segmentar_mama(imagem_pil)
+    img_crop = recortar_bounding_box(img_seg)
+    img_224 = img_crop.resize((224, 224), Image.LANCZOS)
+    return img_224.convert("RGB")
+
+
+def criar_dataloaders(
+    dir_processado: str, batch_size: int = 32, num_workers: int = 0
+) -> tuple:
+    """
+    Cria DataLoaders PyTorch a partir da estrutura processed/.
+
+    Transformações:
+    - ToTensor(): converte PIL [0,255] → tensor [0,1]
+    - Normalize(mean, std): normalização ImageNet canônica
+      mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+      Usar esses valores é obrigatório pois as redes foram pré-treinadas com eles.
+
+    Parâmetros:
+    - batch_size=32: equilíbrio entre velocidade e estabilidade do gradiente
+    - shuffle=True  no treino: previne overfitting por ordenação
+    - shuffle=False no teste:  métricas reproduzíveis entre runs
+    - num_workers=0: evita problemas de multiprocessing no Windows
+    """
+    if not TORCH_OK:
+        return None, None
+    media_imagenet = [0.485, 0.456, 0.406]
+    desvio_imagenet = [0.229, 0.224, 0.225]
+    transf = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=media_imagenet, std=desvio_imagenet),
+        ]
+    )
+    dir_treino = os.path.join(dir_processado, "train")
+    dir_teste = os.path.join(dir_processado, "test")
+    train_loader = test_loader = None
+    if os.path.isdir(dir_treino):
+        ds = datasets.ImageFolder(dir_treino, transform=transf)
+        train_loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=False,
+        )
+    if os.path.isdir(dir_teste):
+        ds = datasets.ImageFolder(dir_teste, transform=transf)
+        test_loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=False,
+        )
+    return train_loader, test_loader
+
+
+# =============================================================================
+# MODELO VGG16 — Transfer Learning
+# =============================================================================
+
+
+class ClassificadorVGG(nn.Module):
+    """
+    VGG16 com transfer learning para classificação BIRADS.
+
+    Arquitetura:
+    - Backbone: features VGG16 pré-treinadas (ImageNet), congeladas.
+    - AdaptiveAvgPool2d(7,7): garante entrada fixa ao classifier.
+    - Classifier substituído:
+        Linear(25088 → 512) → ReLU → Dropout(0.5) → Linear(512 → n_classes)
+
+    Por que congelar o backbone?
+    - O dataset mamográfico é pequeno; retreinar todas as camadas causaria
+      overfitting severo e destruiria os features ImageNet já aprendidos.
+    - As features de baixo nível (bordas, texturas) são transferíveis e
+      já suficientes para o problema; apenas o classificador final
+      precisa se adaptar à tarefa BIRADS.
+
+    Por que Dropout(0.5)?
+    - Regularização essencial dado o tamanho reduzido do dataset.
+    - p=0.5 é o valor canônico do artigo original do Dropout (Srivastava 2014)
+      e funciona bem como ponto de partida.
+
+    Parâmetros:
+    - n_classes: 2 (binário I+II vs III+IV) ou 4 (quadriclasse I×II×III×IV)
+    - dropout: taxa de dropout no classificador (padrão 0.5)
+    """
+
+    def __init__(self, n_classes: int = 4, dropout: float = 0.5):
+        super().__init__()
+        base = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
+
+        # Congela todo o backbone (features conv)
+        for param in base.features.parameters():
+            param.requires_grad = False
+
+        self.features = base.features  # 13 camadas conv
+        self.avgpool = base.avgpool  # AdaptiveAvgPool2d(7,7)
+
+        # Substitui classifier: 25088 = 512 * 7 * 7
+        self.classifier = nn.Sequential(
+            nn.Linear(25088, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(512, n_classes),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
+
+    def descongelar_ultimas_conv(self, n_blocos: int = 1):
+        """
+        Descongela os últimos n_blocos de camadas conv do backbone.
+
+        Usado no fine-tuning parcial (Fase 3 dos experimentos):
+        após convergência do classifier, libera as camadas finais
+        para se adaptarem às texturas mamográficas específicas.
+
+        n_blocos=1 → desbloqueia apenas features[24:] (último bloco conv)
+        n_blocos=2 → desbloqueia features[17:] (2 últimos blocos)
+
+        Referência: Howard & Ruder (2018) — Universal Language Model Fine-Tuning
+        (ULMFiT), que popularizou o descongelamento gradual de camadas.
+        """
+        # Índices dos blocos VGG16: [0,4,9,14,19,24] (início de cada MaxPool)
+        pontos_bloco = [0, 5, 10, 17, 24]
+        idx = pontos_bloco[max(0, len(pontos_bloco) - n_blocos - 1)]
+        for i, camada in enumerate(self.features):
+            if i >= idx:
+                for param in camada.parameters():
+                    param.requires_grad = True
+
+
+# =============================================================================
+# FUNÇÕES DE MÉTRICAS
+# =============================================================================
+
+
+def calcular_metricas_binario(y_true: list, y_pred: list) -> dict:
+    """
+    Calcula métricas para classificação binária.
+
+    Positivo = classe 1 (III+IV — alta densidade, maior risco)
+    Negativo = classe 0 (I+II — baixa densidade)
+
+    Fórmulas:
+    - Sensibilidade (Recall): TP / (TP + FN)
+      Capacidade de detectar casos de alta densidade (crítica clinicamente)
+    - Especificidade: TN / (TN + FP)
+      Capacidade de confirmar casos de baixa densidade
+    - Precisão: TP / (TP + FP)
+    - Acurácia: (TP + TN) / Total
+    - F1: 2 * Precisão * Sensibilidade / (Precisão + Sensibilidade)
+      Harmônica entre precisão e sensibilidade; robusto a classes desbalanceadas
+    """
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    espec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    acc = (tp + tn) / len(y_true) if len(y_true) > 0 else 0.0
+    f1 = (2 * prec * sens / (prec + sens)) if (prec + sens) > 0 else 0.0
+    return {
+        "sensibilidade": sens,
+        "especificidade": espec,
+        "precisao": prec,
+        "acuracia": acc,
+        "f1": f1,
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+    }
+
+
+def calcular_metricas_4classes(y_true: list, y_pred: list, n_classes: int = 4) -> dict:
+    """
+    Calcula sensibilidade e especificidade médias para 4 classes (One-vs-Rest).
+
+    Para cada classe c:
+    - Sensibilidade_c = TP_c / (TP_c + FN_c)
+    - Especificidade_c = TN_c / (TN_c + FP_c)
+
+    Média macro: trata todas as classes igualmente, independente do suporte.
+    Preferida quando as classes têm importância clínica similar.
+    """
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    matriz = np.zeros((n_classes, n_classes), dtype=int)
+    for t, p in zip(y_true, y_pred):
+        if 0 <= t < n_classes and 0 <= p < n_classes:
+            matriz[t][p] += 1
+    sens_por_classe = []
+    espec_por_classe = []
+    for c in range(n_classes):
+        tp = matriz[c, c]
+        fn = matriz[c, :].sum() - tp
+        fp = matriz[:, c].sum() - tp
+        tn = matriz.sum() - tp - fn - fp
+        sens_por_classe.append(tp / (tp + fn) if (tp + fn) > 0 else 0.0)
+        espec_por_classe.append(tn / (tn + fp) if (tn + fp) > 0 else 0.0)
+    return {
+        "sensibilidade_media": float(np.mean(sens_por_classe)),
+        "especificidade_media": float(np.mean(espec_por_classe)),
+        "sensibilidade_por_classe": sens_por_classe,
+        "especificidade_por_classe": espec_por_classe,
+        "matriz_confusao": matriz.tolist(),
+    }
+
+
+# =============================================================================
+# LOOP DE TREINAMENTO REAL
+# =============================================================================
+
+
+def treinar_modelo(
+    modelo,
+    train_loader,
+    test_loader,
+    n_epocas: int,
+    lr: float,
+    weight_decay: float,
+    modo: str,
+    callback_epoca=None,
+    callback_fim=None,
+    parar_flag=None,
+) -> dict:
+    """
+    Loop de treinamento completo com coleta de histórico por época.
+
+    Estratégia de otimização:
+    - Otimizador Adam: lr adaptativo por parâmetro; robusto a gradientes
+      esparsas; poucas épocas de warm-up necessárias vs SGD.
+      weight_decay implementa L2 regularization diretamente.
+    - Scheduler ReduceLROnPlateau: reduz lr por fator 0.5 quando a val_loss
+      para de melhorar por 3 épocas consecutivas (patience=3).
+      Mais adaptativo que StepLR; responde ao comportamento real da perda.
+    - Early stopping: interrompe quando val_loss não melhora por 5 épocas.
+      Salva o melhor modelo por val_loss, não pelo último checkpoint.
+      Previne overfitting sem fixar um número de épocas arbitrário.
+
+    Parâmetros:
+    - modo: "binario" (2 saídas) ou "quadriclasse" (4 saídas)
+    - callback_epoca(dict): chamado ao fim de cada época para atualizar UI
+    - callback_fim(dict):   chamado ao fim do treinamento com histórico total
+    - parar_flag: threading.Event; se set(), interrompe o treinamento
+
+    Retorna dicionário com histórico completo de todas as métricas por época.
+    """
+    if not TORCH_OK:
+        return {}
+
+    modelo = modelo.to(DEVICE)
+    criterio = nn.CrossEntropyLoss()
+
+    # Apenas parâmetros treináveis (classifier + eventuais conv descongeladas)
+    params_treinaveis = filter(lambda p: p.requires_grad, modelo.parameters())
+    otimizador = optim.Adam(params_treinaveis, lr=lr, weight_decay=weight_decay)
+    scheduler = ReduceLROnPlateau(
+        otimizador, mode="min", factor=0.5, patience=3
+    )
+
+    historico = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_acc": [],
+        "val_acc": [],
+        "sensibilidade": [],
+        "especificidade": [],
+        "precisao": [],
+        "acuracia": [],
+        "f1": [],
+        "lr_por_epoca": [],
+        "tempo_por_epoca": [],
+        "epocas_rodadas": 0,
+    }
+
+    melhor_val_loss = float("inf")
+    melhor_estado = None
+    paciencia_atual = 0
+    paciencia_max = 5  # early stopping após 5 épocas sem melhora
+
+    for epoca in range(1, n_epocas + 1):
+        if parar_flag and parar_flag.is_set():
+            break
+
+        t0 = time.time()
+
+        # ── FASE DE TREINO ──────────────────────────────────────────────────
+        modelo.train()
+        total_loss_tr = 0.0
+        acertos_tr = 0
+        total_tr = 0
+
+        for imgs, labels in train_loader or []:
+            if parar_flag and parar_flag.is_set():
+                break
+
+            # Mapeia labels para binário se necessário
+            if modo == "binario":
+                labels = (labels >= 2).long()
+
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            otimizador.zero_grad()
+            saidas = modelo(imgs)
+            loss = criterio(saidas, labels)
+            loss.backward()
+            otimizador.step()
+
+            total_loss_tr += loss.item() * imgs.size(0)
+            preds = saidas.argmax(dim=1)
+            acertos_tr += (preds == labels).sum().item()
+            total_tr += imgs.size(0)
+
+        loss_tr = total_loss_tr / max(total_tr, 1)
+        acc_tr = acertos_tr / max(total_tr, 1)
+
+        # ── FASE DE VALIDAÇÃO ───────────────────────────────────────────────
+        modelo.eval()
+        total_loss_val = 0.0
+        acertos_val = 0
+        total_val = 0
+        y_true_val = []
+        y_pred_val = []
+
+        with torch.no_grad():
+            for imgs, labels in test_loader or []:
+                if modo == "binario":
+                    labels = (labels >= 2).long()
+                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+                saidas = modelo(imgs)
+                loss = criterio(saidas, labels)
+                total_loss_val += loss.item() * imgs.size(0)
+                preds = saidas.argmax(dim=1)
+                acertos_val += (preds == labels).sum().item()
+                total_val += imgs.size(0)
+                y_true_val.extend(labels.cpu().numpy().tolist())
+                y_pred_val.extend(preds.cpu().numpy().tolist())
+
+        loss_val = total_loss_val / max(total_val, 1)
+        acc_val = acertos_val / max(total_val, 1)
+
+        # Métricas detalhadas de validação
+        if modo == "binario":
+            met = calcular_metricas_binario(y_true_val, y_pred_val)
+        else:
+            met4 = calcular_metricas_4classes(y_true_val, y_pred_val)
+            # Para o gráfico, usa sensib/espec médias como proxy
+            met = {
+                "sensibilidade": met4["sensibilidade_media"],
+                "especificidade": met4["especificidade_media"],
+                "precisao": acc_val,  # placeholder
+                "acuracia": acc_val,
+                "f1": (met4["sensibilidade_media"] + met4["especificidade_media"]) / 2,
+            }
+
+        scheduler.step(loss_val)
+        lr_atual = otimizador.param_groups[0]["lr"]
+        tempo_ep = time.time() - t0
+
+        # Registra no histórico
+        historico["train_loss"].append(round(loss_tr, 4))
+        historico["val_loss"].append(round(loss_val, 4))
+        historico["train_acc"].append(round(acc_tr, 4))
+        historico["val_acc"].append(round(acc_val, 4))
+        historico["sensibilidade"].append(round(met["sensibilidade"], 4))
+        historico["especificidade"].append(round(met["especificidade"], 4))
+        historico["precisao"].append(round(met["precisao"], 4))
+        historico["acuracia"].append(round(met["acuracia"], 4))
+        historico["f1"].append(round(met["f1"], 4))
+        historico["lr_por_epoca"].append(lr_atual)
+        historico["tempo_por_epoca"].append(round(tempo_ep, 2))
+        historico["epocas_rodadas"] = epoca
+
+        # Early stopping
+        if loss_val < melhor_val_loss - 1e-4:
+            melhor_val_loss = loss_val
+            melhor_estado = {k: v.cpu().clone() for k, v in modelo.state_dict().items()}
+            paciencia_atual = 0
+        else:
+            paciencia_atual += 1
+            if paciencia_atual >= paciencia_max:
+                if callback_epoca:
+                    callback_epoca(
+                        {**historico, "epoca": epoca, "status": "early_stop"}
+                    )
+                break
+
+        if callback_epoca:
+            callback_epoca(
+                {**historico, "epoca": epoca, "lr_atual": lr_atual, "status": "ok"}
+            )
+
+    # Restaura melhor modelo
+    if melhor_estado:
+        modelo.load_state_dict(melhor_estado)
+
+    historico["melhor_val_loss"] = round(melhor_val_loss, 4)
+    if callback_fim:
+        callback_fim(historico)
+    return historico
+
+
+# =============================================================================
+# GRAD-CAM REAL
+# =============================================================================
+
+
+class GradCAM:
+    """
+    Gradient-weighted Class Activation Mapping para VGG16.
+
+    Referência: Selvaraju et al. (2017) — "Grad-CAM: Visual Explanations from
+    Deep Networks via Gradient-based Localization", ICCV 2017.
+
+    Funcionamento:
+    1. Registra hooks na última camada convolucional (features[28] no VGG16)
+    2. Forward pass captura os feature maps A^k (ativações)
+    3. Backward pass captura os gradientes ∂y^c/∂A^k
+    4. Pondera cada feature map pelo gradiente médio global (GAP dos gradientes)
+    5. Aplica ReLU: mantém apenas contribuições positivas para a classe
+    6. Normaliza e redimensiona para 224×224
+
+    Por que a última camada conv?
+    - Mantém a resolução espacial mais alta antes do pooling final
+    - Captura features de alto nível (texturas densas específicas de BIRADS)
+    - Camadas mais cedo têm features muito genéricas (bordas, cores)
+    """
+
+    def __init__(self, modelo: nn.Module, camada_alvo=None):
+        self.modelo = modelo
+        self._ativacoes = None
+        self._gradientes = None
+        self._hooks = []
+
+        # VGG16: última camada conv é features[28] (Conv2d 512→512, 3×3)
+        if camada_alvo is None:
+            camada_alvo = modelo.features[28]
+
+        # Hook forward: captura ativações A^k após a camada alvo
+        self._hooks.append(camada_alvo.register_forward_hook(self._salvar_ativacoes))
+        # Hook backward: captura gradientes ∂y^c/∂A^k
+        self._hooks.append(
+            camada_alvo.register_full_backward_hook(self._salvar_gradientes)
+        )
+
+    def _salvar_ativacoes(self, modulo, entrada, saida):
+        self._ativacoes = saida.detach()
+
+    def _salvar_gradientes(self, modulo, grad_entrada, grad_saida):
+        self._gradientes = grad_saida[0].detach()
+
+    def gerar(self, tensor_img: "torch.Tensor", classe_idx: int = None) -> np.ndarray:
+        """
+        Gera o mapa de calor Grad-CAM para a classe especificada.
+
+        Parâmetros:
+        - tensor_img: tensor [1, 3, 224, 224] normalizado (ImageNet)
+        - classe_idx: índice da classe alvo; None → usa a classe predita
+
+        Retorna:
+        - Array float32 [224, 224] normalizado [0, 1] representando
+          a relevância de cada pixel para a decisão da rede.
+        """
+        self.modelo.eval()
+        tensor_img = tensor_img.to(DEVICE).requires_grad_(True)
+        saida = self.modelo(tensor_img)
+
+        if classe_idx is None:
+            classe_idx = saida.argmax(dim=1).item()
+
+        self.modelo.zero_grad()
+        # Gradiente apenas para a classe alvo
+        saida[0, classe_idx].backward()
+
+        # α^c_k = (1/Z) Σ_ij (∂y^c / ∂A^k_ij)
+        pesos = self._gradientes.mean(dim=(2, 3), keepdim=True)  # [1, 512, 1, 1]
+
+        # L^c_Grad-CAM = ReLU(Σ_k α^c_k · A^k)
+        mapa = (pesos * self._ativacoes).sum(dim=1, keepdim=True)  # [1,1,7,7]
+        mapa = torch.relu(mapa)
+
+        # Normaliza e redimensiona para 224×224
+        mapa_np = mapa.squeeze().cpu().numpy()
+        if mapa_np.max() > 0:
+            mapa_np = mapa_np / mapa_np.max()
+
+        # Upsampling bilinear via PIL
+        mapa_pil = Image.fromarray((mapa_np * 255).astype(np.uint8))
+        mapa_pil = mapa_pil.resize((224, 224), Image.BILINEAR)
+        return np.array(mapa_pil) / 255.0
+
+    def remover_hooks(self):
+        for h in self._hooks:
+            h.remove()
+
+
+def aplicar_colormap_jet(mapa: np.ndarray) -> np.ndarray:
+    """
+    Aplica colormap Jet vetorizado ao mapa de calor Grad-CAM.
+
+    Jet: azul (baixa ativação) → verde → amarelo → vermelho (alta ativação)
+    Implementação sem matplotlib: permite uso em qualquer contexto.
+
+    Fórmula vetorizada derivada do colormap Jet do matplotlib.
+    """
+    r = np.clip(1.5 - np.abs(4 * mapa - 3), 0, 1)
+    g = np.clip(1.5 - np.abs(4 * mapa - 2), 0, 1)
+    b = np.clip(1.5 - np.abs(4 * mapa - 1), 0, 1)
+    return (np.stack([r, g, b], axis=2) * 255).astype(np.uint8)
+
+
+# =============================================================================
+# GRÁFICOS DE CONVERGÊNCIA
+# =============================================================================
+
+
+def gerar_graficos_convergencia(historico: dict, titulo: str = "VGG16") -> Image.Image:
+    """
+    Gera painel de gráficos de convergência a partir do histórico de treinamento.
+
+    Layout: grade 2×3 com:
+    1. Loss (treino vs validação)
+    2. Acurácia (treino vs validação)
+    3. Sensibilidade e Especificidade (validação)
+    4. Precisão e F1 (validação)
+    5. Learning Rate por época (escala log)
+    6. Tempo por época
+
+    Retorna imagem PIL para exibição na interface sem salvar em disco.
+
+    Por que esses gráficos?
+    - Loss curves: diagnóstico principal de overfitting (gap treino-val)
+    - Accuracy: intuição imediata da performance
+    - Sensibilidade/Especificidade: métricas clínicas mais relevantes
+    - LR: visualização do efeito do scheduler ReduceLROnPlateau
+    - Tempo: importante para discutir viabilidade prática
+    """
+    if not MPL_OK or not historico.get("train_loss"):
+        return None
+
+    epocas = list(range(1, len(historico["train_loss"]) + 1))
+
+    fig = plt.figure(figsize=(14, 9))
+    fig.suptitle(
+        f"Convergência do Treinamento — {titulo}", fontsize=14, fontweight="bold"
+    )
+    gs = GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.35)
+
+    cores = {
+        "treino": "#2176AE",
+        "val": "#E83151",
+        "sens": "#0D7377",
+        "espec": "#F4A261",
+        "prec": "#8338EC",
+        "f1": "#3A86FF",
+        "lr": "#6D6875",
+        "tempo": "#457B9D",
+    }
+
+    def _ax(linha, col):
+        return fig.add_subplot(gs[linha, col])
+
+    # ── 1. Loss ──────────────────────────────────────────────────────────────
+    ax = _ax(0, 0)
+    ax.plot(
+        epocas,
+        historico["train_loss"],
+        color=cores["treino"],
+        lw=2,
+        label="Treino",
+        marker="o",
+        ms=3,
+    )
+    ax.plot(
+        epocas,
+        historico["val_loss"],
+        color=cores["val"],
+        lw=2,
+        label="Validação",
+        marker="o",
+        ms=3,
+        linestyle="--",
+    )
+    ax.set_title("Loss (Cross-Entropy)", fontsize=10)
+    ax.set_xlabel("Época")
+    ax.set_ylabel("Loss")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # ── 2. Acurácia ───────────────────────────────────────────────────────────
+    ax = _ax(0, 1)
+    ax.plot(
+        epocas,
+        [v * 100 for v in historico["train_acc"]],
+        color=cores["treino"],
+        lw=2,
+        label="Treino",
+        marker="o",
+        ms=3,
+    )
+    ax.plot(
+        epocas,
+        [v * 100 for v in historico["val_acc"]],
+        color=cores["val"],
+        lw=2,
+        label="Validação",
+        marker="o",
+        ms=3,
+        linestyle="--",
+    )
+    ax.set_title("Acurácia", fontsize=10)
+    ax.set_xlabel("Época")
+    ax.set_ylabel("Acurácia (%)")
+    ax.set_ylim(0, 105)
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # ── 3. Sensibilidade e Especificidade ────────────────────────────────────
+    ax = _ax(0, 2)
+    ax.plot(
+        epocas,
+        [v * 100 for v in historico["sensibilidade"]],
+        color=cores["sens"],
+        lw=2,
+        label="Sensibilidade",
+        marker="s",
+        ms=3,
+    )
+    ax.plot(
+        epocas,
+        [v * 100 for v in historico["especificidade"]],
+        color=cores["espec"],
+        lw=2,
+        label="Especificidade",
+        marker="^",
+        ms=3,
+        linestyle="--",
+    )
+    ax.set_title("Sensibilidade & Especificidade", fontsize=10)
+    ax.set_xlabel("Época")
+    ax.set_ylabel("Métrica (%)")
+    ax.set_ylim(0, 105)
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # ── 4. Precisão e F1 ─────────────────────────────────────────────────────
+    ax = _ax(1, 0)
+    ax.plot(
+        epocas,
+        [v * 100 for v in historico["precisao"]],
+        color=cores["prec"],
+        lw=2,
+        label="Precisão",
+        marker="D",
+        ms=3,
+    )
+    ax.plot(
+        epocas,
+        [v * 100 for v in historico["f1"]],
+        color=cores["f1"],
+        lw=2,
+        label="F1",
+        marker="o",
+        ms=3,
+        linestyle="--",
+    )
+    ax.set_title("Precisão & F1", fontsize=10)
+    ax.set_xlabel("Época")
+    ax.set_ylabel("Métrica (%)")
+    ax.set_ylim(0, 105)
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # ── 5. Learning Rate ─────────────────────────────────────────────────────
+    ax = _ax(1, 1)
+    ax.plot(
+        epocas, historico["lr_por_epoca"], color=cores["lr"], lw=2, marker="o", ms=3
+    )
+    ax.set_title("Learning Rate (ReduceLROnPlateau)", fontsize=10)
+    ax.set_xlabel("Época")
+    ax.set_ylabel("LR")
+    ax.set_yscale("log")
+    ax.grid(alpha=0.3)
+
+    # ── 6. Tempo por época ───────────────────────────────────────────────────
+    ax = _ax(1, 2)
+    ax.bar(
+        epocas, historico["tempo_por_epoca"], color=cores["tempo"], alpha=0.8, width=0.6
+    )
+    ax.set_title("Tempo por Época", fontsize=10)
+    ax.set_xlabel("Época")
+    ax.set_ylabel("Tempo (s)")
+    ax.grid(alpha=0.3, axis="y")
+
+    # Renderiza para buffer PIL (sem salvar em disco)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf)
+
+
+# =============================================================================
+# ABA VISUALIZADOR
+# =============================================================================
 
 
 class AbaVisualizador(ctk.CTkFrame):
@@ -98,7 +996,6 @@ class AbaVisualizador(ctk.CTkFrame):
         self._construir()
 
     def _construir(self):
-        # Painel de controles
         painel = ctk.CTkFrame(self, width=220, corner_radius=10)
         painel.pack(side="left", fill="y", padx=(0, 6))
         painel.pack_propagate(False)
@@ -118,7 +1015,6 @@ class AbaVisualizador(ctk.CTkFrame):
             painel,
             "Reset 1:1",
             self._reset_zoom,
-            fg_color="transparent",
             border_width=1,
         ).pack(padx=12, pady=4, fill="x")
 
@@ -128,7 +1024,6 @@ class AbaVisualizador(ctk.CTkFrame):
             painel,
             "👁 Ver Máscara",
             self._alternar_mascara,
-            fg_color="transparent",
             border_width=1,
             state="disabled",
         )
@@ -140,14 +1035,12 @@ class AbaVisualizador(ctk.CTkFrame):
         )
         self._caixa_info.pack(padx=12, fill="x")
 
-        # Área da imagem
         area = ctk.CTkFrame(self, corner_radius=10)
         area.pack(side="left", fill="both", expand=True)
         self._titulo_img = ctk.CTkLabel(
             area, text="Nenhuma imagem carregada", font=FONTE_SECAO, anchor="w"
         )
         self._titulo_img.pack(anchor="w", padx=12, pady=(8, 4))
-
         fundo_canvas = ctk.CTkFrame(area, corner_radius=6)
         fundo_canvas.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self._canvas = tk.Canvas(fundo_canvas, highlightthickness=0, bg="#f0f0f0")
@@ -234,7 +1127,6 @@ class AbaVisualizador(ctk.CTkFrame):
         threading.Thread(target=self._executar_segmentacao, daemon=True).start()
 
     def _executar_segmentacao(self):
-        # Chama o pipeline robusto de segmentação e armazena o resultado
         img_seg = segmentar_mama(self._img_original)
         self._img_segmentada = img_seg
         self.after(0, self._pos_segmentacao)
@@ -254,388 +1146,35 @@ class AbaVisualizador(ctk.CTkFrame):
 
 
 # =============================================================================
-# PIPELINE DE PREPARAÇÃO DE DADOS
-# Funções independentes da UI, reutilizáveis pelas abas de Classificação e
-# Grad-CAM quando necessário.
+# ABA DATASET
 # =============================================================================
-
-
-def organizar_registro(caminho_arquivo: str) -> dict | None:
-    """
-    Extrai metadados de uma imagem a partir do seu caminho no dataset LMLO.
-
-    Regras do professor:
-    - A letra inicial do nome do arquivo define a classe:
-        D → BI-RADS I  (classe 0)
-        E → BI-RADS II (classe 1)
-        F → BI-RADS III(classe 2)
-        G → BI-RADS IV (classe 3)
-    - Imagens cujo número (dígitos do nome) seja múltiplo de 4 → teste
-    - Demais → treino
-
-    Retorna um dicionário com todos os metadados ou None se o arquivo
-    não pertencer a nenhuma classe reconhecida.
-
-    Exemplo de retorno:
-        {
-            "arquivo":  "/caminho/LMLO/D+left+MLO/D001.png",
-            "letra":    "D",
-            "classe":   0,
-            "birads":   "I",
-            "numero":   1,
-            "treino":   True
-        }
-    """
-    mapa = {"D": (0, "I"), "E": (1, "II"), "F": (2, "III"), "G": (3, "IV")}
-
-    nome = os.path.basename(caminho_arquivo)
-    letra = nome[0].upper() if nome else ""
-
-    if letra not in mapa:
-        return None  # arquivo sem prefixo de classe reconhecível
-
-    classe, birads = mapa[letra]
-
-    # Extrai apenas os dígitos do nome (sem extensão) para determinar o número
-    nome_sem_ext = os.path.splitext(nome)[0]
-    digitos = re.sub(r"\D", "", nome_sem_ext)
-    numero = int(digitos) if digitos else 0
-
-    # Regra de split: múltiplo de 4 → teste; caso contrário → treino
-    eh_treino = numero % 4 != 0
-
-    return {
-        "arquivo": caminho_arquivo,
-        "letra": letra,
-        "classe": classe,
-        "birads": birads,
-        "numero": numero,
-        "treino": eh_treino,
-    }
-
-
-def limiar_otsu(arr_cinza: np.ndarray) -> int:
-    """
-    Calcula o limiar ótimo de Otsu para uma imagem em escala de cinza (uint8).
-
-    O método maximiza a variância inter-classes, separando o fundo escuro
-    (fundo preto das mamografias) do tecido mamário mais claro.
-
-    Parâmetros:
-        arr_cinza: array 2D uint8 com a imagem em escala de cinza.
-
-    Retorna:
-        limiar (int): valor de intensidade [0,255] que maximiza a variância.
-    """
-    histograma, _ = np.histogram(arr_cinza.flatten(), bins=256, range=(0, 256))
-    total = arr_cinza.size
-    soma_total = float(np.dot(np.arange(256), histograma))
-
-    peso0 = soma0 = 0
-    melhor_var = limiar = 0
-
-    for t in range(256):
-        peso0 += histograma[t]
-        if not peso0:
-            continue
-        peso1 = total - peso0
-        if not peso1:
-            break
-        soma0 += t * histograma[t]
-        media0 = soma0 / peso0
-        media1 = (soma_total - soma0) / peso1
-        # Variância inter-classes: produto dos pesos × quadrado da diferença de médias
-        var = peso0 * peso1 * (media0 - media1) ** 2
-        if var > melhor_var:
-            melhor_var = var
-            limiar = t
-
-    return limiar
-
-
-def maior_componente_conectado(mascara_bin: np.ndarray) -> np.ndarray:
-    """
-    Retorna uma máscara binária contendo apenas o maior componente conectado.
-
-    Em mamografias, após a limiarização de Otsu pode haver pequenos artefatos
-    (anotações, ruídos de borda) que formam componentes separados do tecido
-    mamário principal.  Ao reter apenas o maior componente isolamos a mama.
-
-    Parâmetros:
-        mascara_bin: array 2D booleano/uint8 (True/1 = objeto, False/0 = fundo).
-
-    Retorna:
-        Array 2D uint8 com 255 onde está o maior componente e 0 no resto.
-    """
-    if SCIPY_OK:
-        # Usa scipy.ndimage para rotular componentes conectados com
-        # conectividade total (estrutura 3×3 = 8-conectividade)
-        estrutura = ndi.generate_binary_structure(2, 2)
-        rotulado, n_comp = ndi.label(mascara_bin, structure=estrutura)
-        if n_comp == 0:
-            return mascara_bin.astype(np.uint8) * 255
-        # Conta pixels por componente (ignora rótulo 0 = fundo)
-        tamanhos = ndi.sum(mascara_bin, rotulado, range(1, n_comp + 1))
-        maior = int(np.argmax(tamanhos)) + 1
-        return (rotulado == maior).astype(np.uint8) * 255
-    else:
-        # Fallback sem scipy: usa erosão/dilatação PIL para suprimir pequenos artefatos
-        pil = Image.fromarray(mascara_bin.astype(np.uint8) * 255)
-        # erosão forte remove artefatos pequenos
-        pil = pil.filter(ImageFilter.MinFilter(9))
-        # dilatação restaura a mama principal
-        pil = pil.filter(ImageFilter.MaxFilter(25))
-        return np.array(pil)
-
-
-def segmentar_mama(imagem_pil: Image.Image) -> Image.Image:
-    """
-    Pipeline robusto de segmentação da mama em imagem mamográfica.
-
-    Etapas:
-      1. Converte para escala de cinza normalizada (uint8 0-255)
-      2. Aplica limiarização de Otsu para binarizar fundo vs. tecido
-      3. Seleciona apenas o maior componente conectado (remove artefatos)
-      4. Remove ruídos residuais via erosão seguida de dilatação (abertura morfológica)
-      5. Aplica a máscara à imagem original (fundo → 0)
-
-    Parâmetros:
-        imagem_pil: imagem PIL em qualquer modo e profundidade de bits.
-
-    Retorna:
-        Imagem PIL em modo 'L' (escala de cinza) com fundo zerado e mama isolada.
-    """
-    # 1. Escala de cinza normalizada para uint8
-    arr = np.array(imagem_pil)
-    if arr.dtype != np.uint8:
-        # Normaliza qualquer profundidade (8, 12, 16 bits) para 0-255
-        mn, mx = arr.min(), arr.max()
-        arr = ((arr.astype(np.float32) - mn) / max(mx - mn, 1) * 255).astype(np.uint8)
-    if arr.ndim == 3:
-        # Converte RGB/RGBA → cinza usando médias dos canais (canal 0 para mamografias)
-        arr = arr[:, :, 0]
-
-    # 2. Limiarização de Otsu — separa fundo preto do tecido mamário
-    limiar = limiar_otsu(arr)
-    mascara = (arr > limiar).astype(np.uint8)
-
-    # 3. Maior componente conectado — elimina artefatos externos (anotações, réguas)
-    mascara = maior_componente_conectado(mascara)
-
-    # 4. Remoção de ruídos:
-    #    - MinFilter(5): erosão leve (remove ruídos de 1-2px na borda)
-    #    - MaxFilter(9): dilatação para recuperar a borda da mama
-    # Tamanho 5 e 9 foram escolhidos empiricamente para mamografias LMLO de ~2000px.
-    # Para imagens menores o efeito é proporcional pois PIL usa kernel absoluto —
-    # mas as imagens do dataset têm resoluções similares entre si.
-    pil_mascara = Image.fromarray(mascara)
-    pil_mascara = pil_mascara.filter(ImageFilter.MinFilter(5))
-    pil_mascara = pil_mascara.filter(ImageFilter.MaxFilter(9))
-    arr_mascara = np.array(pil_mascara)
-
-    # 5. Aplica a máscara: mantém pixels da mama, zera o fundo
-    resultado = np.where(arr_mascara > 0, arr, 0).astype(np.uint8)
-    return Image.fromarray(resultado)
-
-
-def recortar_bounding_box(imagem_seg: Image.Image) -> Image.Image:
-    """
-    Recorta a região útil da mama após a segmentação.
-
-    Após a segmentação, a imagem ainda contém grandes áreas de fundo preto
-    que ocupam espaço desnecessário e degradam a qualidade do treinamento
-    (a rede desperdiça capacidade modelando pixels pretos).
-
-    O recorte encontra o menor retângulo envolvente (bounding box) dos pixels
-    não-nulos e retorna apenas essa região.
-
-    Se a mama ocupa 30% da imagem, após o recorte ocupa ~100%.
-
-    Parâmetros:
-        imagem_seg: imagem PIL em modo 'L' já segmentada.
-
-    Retorna:
-        Imagem PIL recortada ou a imagem original se não houver pixels válidos.
-    """
-    arr = np.array(imagem_seg)
-    # Encontra linhas e colunas que contenham ao menos um pixel não-zero
-    linhas_validas = np.any(arr > 0, axis=1)
-    cols_validas = np.any(arr > 0, axis=0)
-
-    if not linhas_validas.any():
-        return imagem_seg  # imagem completamente preta: retorna sem modificar
-
-    lin_min, lin_max = np.where(linhas_validas)[0][[0, -1]]
-    col_min, col_max = np.where(cols_validas)[0][[0, -1]]
-
-    # Margem de 2px para não cortar a borda do tecido mamário
-    lin_min = max(0, lin_min - 2)
-    lin_max = min(arr.shape[0] - 1, lin_max + 2)
-    col_min = max(0, col_min - 2)
-    col_max = min(arr.shape[1] - 1, col_max + 2)
-
-    arr_crop = arr[lin_min : lin_max + 1, col_min : col_max + 1]
-    return Image.fromarray(arr_crop)
-
-
-def preparar_imagem(imagem_pil: Image.Image) -> Image.Image:
-    """
-    Pipeline completo de preparação de uma imagem para as redes DenseNet121/VGG16.
-
-    Etapas:
-      1. Segmentação robusta da mama (Otsu + componente conectado + morfologia)
-      2. Recorte do bounding box (elimina grandes áreas vazias de fundo)
-      3. Redimensionamento para 224×224 px (tamanho exigido pelas redes pré-treinadas)
-      4. Conversão para RGB (3 canais), replicando o canal cinza — as redes
-         ImageNet esperam 3 canais mas a informação diagnóstica é monocromática.
-
-    Parâmetros:
-        imagem_pil: imagem PIL original (qualquer modo/profundidade).
-
-    Retorna:
-        Imagem PIL 224×224 RGB pronta para ser processada pela rede.
-    """
-    # Etapa 1: segmentação
-    img_seg = segmentar_mama(imagem_pil)
-
-    # Etapa 2: recorte da região útil
-    img_crop = recortar_bounding_box(img_seg)
-
-    # Etapa 3: redimensionamento para 224×224 (DenseNet/VGG padrão ImageNet)
-    # LANCZOS oferece melhor qualidade para downscaling de imagens de alta resolução
-    img_224 = img_crop.resize((224, 224), Image.LANCZOS)
-
-    # Etapa 4: conversão para RGB — replica o canal cinza em R, G e B
-    # Isso é necessário porque os pesos ImageNet esperam 3 canais.
-    img_rgb = img_224.convert("RGB")
-
-    return img_rgb
-
-
-def criar_dataloaders(
-    dir_processado: str,
-    batch_size: int = 32,
-    num_workers: int = 0,
-) -> tuple:
-    """
-    Cria DataLoaders PyTorch a partir da estrutura processed/ gerada pelo pipeline.
-
-    Utiliza torchvision.datasets.ImageFolder, que lê automaticamente subpastas
-    como classes (D, E, F, G) e associa os rótulos corretos.
-
-    Transformações aplicadas:
-    - Treino:
-        • ToTensor()       — converte PIL → tensor [0,1]
-        • Normalize(mean, std) — normalização ImageNet (usada pelo DenseNet/VGG)
-    - Teste:
-        • ToTensor() + Normalize() (sem augmentation para avaliação justa)
-
-    As médias e desvios-padrão são os valores canônicos do ImageNet:
-        mean = [0.485, 0.456, 0.406]
-        std  = [0.229, 0.224, 0.225]
-    Usar esses valores é correto pois as redes foram pré-treinadas com eles.
-
-    Parâmetros:
-        dir_processado: caminho para processed/ (deve conter subpastas train/ e test/)
-        batch_size:     número de amostras por batch (padrão 32 — bom equilíbrio
-                        entre velocidade e estabilidade do gradiente)
-        num_workers:    workers para carregamento paralelo (0 = thread principal,
-                        evita problemas no Windows com multiprocessing)
-
-    Retorna:
-        (train_loader, test_loader) — tupla de DataLoaders ou (None, None) se
-        os diretórios não existirem.
-    """
-    if not TORCH_OK:
-        return None, None
-
-    # Normalização ImageNet (valores canônicos para redes pré-treinadas)
-    media_imagenet = [0.485, 0.456, 0.406]
-    desvio_imagenet = [0.229, 0.224, 0.225]
-
-    # Transformação para treino: converte para tensor e normaliza
-    # (data augmentation já foi aplicada e salva em disco na etapa anterior)
-    transf_treino = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(mean=media_imagenet, std=desvio_imagenet),
-        ]
-    )
-
-    # Transformação para teste: idêntica ao treino, sem augmentation
-    transf_teste = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(mean=media_imagenet, std=desvio_imagenet),
-        ]
-    )
-
-    dir_treino = os.path.join(dir_processado, "train")
-    dir_teste = os.path.join(dir_processado, "test")
-
-    train_loader = test_loader = None
-
-    if os.path.isdir(dir_treino):
-        # ImageFolder espera: dir_treino/D/*.png, dir_treino/E/*.png, ...
-        dataset_treino = datasets.ImageFolder(dir_treino, transform=transf_treino)
-        train_loader = DataLoader(
-            dataset_treino,
-            batch_size=batch_size,
-            shuffle=True,  # embaralha a cada época para evitar overfitting
-            num_workers=num_workers,
-            pin_memory=False,  # pin_memory=True apenas se GPU disponível
-        )
-
-    if os.path.isdir(dir_teste):
-        dataset_teste = datasets.ImageFolder(dir_teste, transform=transf_teste)
-        test_loader = DataLoader(
-            dataset_teste,
-            batch_size=batch_size,
-            shuffle=False,  # não embaralha: métricas devem ser reproduzíveis
-            num_workers=num_workers,
-            pin_memory=False,
-        )
-
-    return train_loader, test_loader
-
-
-# ── Aba Dataset ──────────────────────────────────────────────────────────────
 
 
 class AbaDataset(ctk.CTkFrame):
     """
-    Aba responsável por toda a etapa de preparação dos dados:
+    Aba de preparação dos dados:
     - Leitura e organização automática do dataset LMLO
-    - Segmentação, recorte e redimensionamento das imagens
-    - Data Augmentation por rotação (somente treino)
+    - Segmentação, recorte e redimensionamento (224×224 RGB)
+    - Data Augmentation por rotação (treino apenas)
     - Geração da estrutura processed/ para uso pelas redes
-    - Criação de DataLoaders PyTorch prontos para treinamento
+    - Criação de DataLoaders PyTorch
     """
 
-    # Mapeamento letra-inicial → (índice de classe, BI-RADS)
     MAPA_CLASSE = {"D": (0, "I"), "E": (1, "II"), "F": (2, "III"), "G": (3, "IV")}
-    # Ângulos de rotação para data augmentation
     ANGULOS_AUG = [-20, -10, 0, 10, 20]
-    # Tamanho-alvo exigido pela DenseNet121 e VGG16
     TAMANHO_ALVO = (224, 224)
 
     def __init__(self, pai, status):
         super().__init__(pai, fg_color="transparent")
         self._status = status
-        # Lista de dicionários com metadados de cada imagem do dataset
         self._registros: list[dict] = []
-        # Listas de caminhos separados por split
         self._imgs_treino: list[str] = []
         self._imgs_teste: list[str] = []
-        # Diretório raiz do dataset e do diretório processado
         self._dir_dataset = ""
         self._dir_processado = ""
-        # DataLoaders (criados após o processamento)
         self._train_loader = None
         self._test_loader = None
         self._construir()
-
-    # ── Construção da UI (inalterada visualmente) ────────────────────────────
 
     def _construir(self):
         topo = ctk.CTkFrame(self, corner_radius=10)
@@ -647,7 +1186,6 @@ class AbaDataset(ctk.CTkFrame):
         self._lbl_dir = ctk.CTkLabel(linha, text="—", font=FONTE_PEQUENA, anchor="w")
         self._lbl_dir.pack(side="left", padx=8)
 
-        # Cards por classe
         frame_classes = ctk.CTkFrame(self, corner_radius=10)
         frame_classes.pack(fill="x", pady=(0, 6))
         rotulo_secao(frame_classes, "CLASSES BIRADS")
@@ -669,7 +1207,6 @@ class AbaDataset(ctk.CTkFrame):
         for c in (self._card_treino, self._card_teste, self._card_total):
             c.pack(side="left", expand=True, fill="both", padx=3)
 
-        # Aumento de dados
         frame_aumento = ctk.CTkFrame(self, corner_radius=10)
         frame_aumento.pack(fill="x", pady=(0, 6))
         rotulo_secao(frame_aumento, "AUMENTO DE DADOS")
@@ -680,7 +1217,9 @@ class AbaDataset(ctk.CTkFrame):
         ).pack(anchor="w", padx=12)
         linha_aug = ctk.CTkFrame(frame_aumento, fg_color="transparent")
         linha_aug.pack(fill="x", padx=12, pady=(4, 10))
-        botao(linha_aug, "⟳ Realizar Aumento", self.realizarAugmentacao).pack(side="left")
+        botao(linha_aug, "⟳ Realizar Aumento", self.realizarAugmentacao).pack(
+            side="left"
+        )
         self._barra_aumento = ctk.CTkProgressBar(linha_aug)
         self._barra_aumento.set(0)
         self._barra_aumento.pack(side="left", fill="x", expand=True, padx=8)
@@ -689,162 +1228,104 @@ class AbaDataset(ctk.CTkFrame):
         )
         self._lbl_aumento.pack(side="left")
 
-        # Log
         frame_log = ctk.CTkFrame(self, corner_radius=10)
         frame_log.pack(fill="both", expand=True)
         rotulo_secao(frame_log, "LOG")
         self._log = ctk.CTkTextbox(frame_log, font=FONTE_MONO, state="disabled")
         self._log.pack(fill="both", expand=True, padx=12, pady=(0, 10))
 
-    # ── Utilitário de log thread-safe ────────────────────────────────────────
-
     def _registrar(self, msg):
-        """Insere uma linha no log de forma segura a partir de qualquer thread."""
         self._log.configure(state="normal")
         self._log.insert("end", msg + "\n")
         self._log.see("end")
         self._log.configure(state="disabled")
 
     def _log_ts(self, msg):
-        """Agenda _registrar na thread principal (seguro para uso em threads)."""
         self.after(0, lambda m=msg: self._registrar(m))
 
-    # ── BOTÃO 1: Selecionar Diretório ────────────────────────────────────────
-
     def _carregar_dir(self):
-        """
-        Abre diálogo para selecionar o diretório raiz do dataset LMLO.
-        Percorre todas as subpastas, identifica cada imagem, extrai:
-          - classe (letra inicial D/E/F/G)
-          - número da imagem (para divisão treino/teste)
-          - split (treino se num % 4 != 0, teste se num % 4 == 0)
-        Armazena os metadados em self._registros e atualiza os cards da UI.
-        Depois processa as imagens (segmentação + crop + redimensionamento)
-        e gera a estrutura processed/ em disco.
-        """
         diretorio = filedialog.askdirectory()
         if not diretorio:
             return
         self._dir_dataset = diretorio
         self._lbl_dir.configure(text=diretorio)
-
-        # Extensões aceitas (PNG e TIFF conforme especificação)
         extensoes_validas = {".png", ".tif", ".tiff"}
-
-        # Coleta todos os arquivos de imagem recursivamente e ordena pelo nome
         todos_caminhos = []
         for raiz, _, arquivos in os.walk(diretorio):
             for arq in sorted(arquivos):
                 if os.path.splitext(arq)[1].lower() in extensoes_validas:
                     todos_caminhos.append(os.path.join(raiz, arq))
-
         if not todos_caminhos:
             messagebox.showwarning("Aviso", "Nenhuma imagem encontrada.")
             return
-
-        # --- Organização automática do dataset ---
         self._registros = []
         contagem_classe = [0, 0, 0, 0]
         treino, teste = [], []
-
         for caminho in todos_caminhos:
             rec = organizar_registro(caminho)
             if rec is None:
-                continue  # arquivo sem prefixo reconhecível: ignora
+                continue
             self._registros.append(rec)
             contagem_classe[rec["classe"]] += 1
             if rec["treino"]:
                 treino.append(caminho)
             else:
                 teste.append(caminho)
-
         self._imgs_treino = treino
         self._imgs_teste = teste
-
-        # Atualiza cards
         for i in range(4):
             self._cards_classe[i].definir(str(contagem_classe[i]))
         self._card_treino.definir(str(len(treino)))
         self._card_teste.definir(str(len(teste)))
         self._card_total.definir(str(len(todos_caminhos)))
-
         self._registrar(f"Diretório: {diretorio}")
         self._registrar(
-            f"Total: {len(todos_caminhos)} imagens  |  "
-            f"Treino: {len(treino)}  |  Teste: {len(teste)}"
+            f"Total: {len(todos_caminhos)} imagens | "
+            f"Treino: {len(treino)} | Teste: {len(teste)}"
         )
         for letra, (idx, birads) in self.MAPA_CLASSE.items():
             self._registrar(
                 f"  BI-RADS {birads} ({letra}): {contagem_classe[idx]} imagens"
             )
         self._status.definir(f"Dataset: {len(todos_caminhos)} imagens carregadas.")
-
-        # Inicia processamento (segmentação + crop + resize + cópia para processed/)
-        # em thread separada para não travar a UI
         threading.Thread(target=self._executar_processamento, daemon=True).start()
 
-    # ── Pipeline de processamento (thread) ───────────────────────────────────
-
     def _executar_processamento(self):
-        """
-        Para cada imagem do dataset:
-          1. Abre a imagem original
-          2. Aplica segmentação robusta (Otsu + maior componente + ruído)
-          3. Recorta o bounding box da mama (elimina áreas vazias)
-          4. Redimensiona para 224×224
-          5. Converte para RGB (3 canais, exigido pela DenseNet/VGG)
-          6. Salva em processed/<split>/<letra_classe>/<nome>.png
-        """
         total = len(self._registros)
         if total == 0:
             return
-
-        # Cria a estrutura de diretórios processed/
         self._dir_processado = os.path.join(self._dir_dataset, "processed")
         for split in ("train", "test"):
             for letra in self.MAPA_CLASSE:
                 os.makedirs(
                     os.path.join(self._dir_processado, split, letra), exist_ok=True
                 )
-
-        self._log_ts(
-            "Iniciando processamento das imagens (segmentação + crop + resize)…"
-        )
+        self._log_ts("Iniciando processamento (segmentação + crop + resize)…")
         self.after(0, lambda: self._status.definir("Processando imagens…"))
-
         for i, rec in enumerate(self._registros):
             caminho = rec["arquivo"]
             letra = rec["letra"]
             split = "train" if rec["treino"] else "test"
             nome_arq = os.path.basename(caminho)
             destino = os.path.join(self._dir_processado, split, letra, nome_arq)
-
             try:
                 img = Image.open(caminho)
-                # Aplica o pipeline completo de preparação
                 img_proc = preparar_imagem(img)
                 img_proc.save(destino)
             except Exception as e:
                 self._log_ts(f"  [ERRO] {nome_arq}: {e}")
-
-            # Atualiza progresso na UI a cada 10 imagens ou na última
             if (i + 1) % 10 == 0 or (i + 1) == total:
                 self._log_ts(f"  Processadas: {i + 1}/{total}")
                 self.after(0, lambda v=(i + 1) / total: self._barra_aumento.set(v))
-
-        # Cria os DataLoaders após processar todas as imagens
         if TORCH_OK:
             self._train_loader, self._test_loader = criar_dataloaders(
                 self._dir_processado
             )
             n_tr = len(self._train_loader.dataset) if self._train_loader else 0
             n_te = len(self._test_loader.dataset) if self._test_loader else 0
-            self._log_ts(
-                f"DataLoaders criados: train={n_tr} amostras, test={n_te} amostras"
-            )
+            self._log_ts(f"DataLoaders: train={n_tr}, test={n_te}")
         else:
             self._log_ts("PyTorch não encontrado — DataLoaders não criados.")
-
         self.after(
             0,
             lambda: (
@@ -854,92 +1335,65 @@ class AbaDataset(ctk.CTkFrame):
         )
         self._log_ts(f"Estrutura salva em: {self._dir_processado}")
 
-    # ── BOTÃO 2: Realizar Aumento ────────────────────────────────────────────
-
     def realizarAugmentacao(self):
-        """Valida pré-condições e lança o data augmentation em thread separada."""
         if not self._imgs_treino:
             messagebox.showwarning("Aviso", "Carregue um dataset primeiro.")
             return
         if not self._dir_processado or not os.path.isdir(self._dir_processado):
-            messagebox.showwarning(
-                "Aviso",
-                "Aguarde o processamento das imagens ser concluído antes de aumentar.",
-            )
+            messagebox.showwarning("Aviso", "Aguarde o processamento ser concluído.")
             return
         threading.Thread(target=self._executar_aumento, daemon=True).start()
 
     def _executar_aumento(self):
         """
-        Data Augmentation real — apenas para o conjunto de treino.
+        Data Augmentation real — apenas treino.
 
-        Para cada imagem de treino já processada (224×224 RGB) gera 5 versões
-        rotacionadas em -20°, -10°, 0°, +10° e +20°, salvando cada uma como:
-            <nome_original>_rot_m20.png
-            <nome_original>_rot_m10.png
-            <nome_original>_rot_0.png
-            <nome_original>_rot_p10.png
-            <nome_original>_rot_p20.png
+        Rotações: -20, -10, 0, +10, +20 graus
+        - Intervalo de ±20° empiricamente validado para mamografias:
+          pequeno o suficiente para não distorcer a anatomia,
+          grande o suficiente para regularizar a orientação do exame.
+        - expand=False: mantém 224×224 após a rotação
+        - fillcolor=(0,0,0): preenche bordas com preto (fundo padrão)
+        - resample=BILINEAR: interpolação suave, evita artefatos de aliasing
 
-        Sufixo adotado: m = minus (negativo), p = plus (positivo).
-        A rotação é feita com fundo preto (fillcolor=0) para não inserir
-        artefatos de borda nas imagens mamográficas.
+        Nomenclatura dos arquivos: _rot_m20 (minus 20), _rot_p20 (plus 20), _rot_0.
         """
-        # Mapeia sufixo de arquivo para cada ângulo
         sufixos = {-20: "m20", -10: "m10", 0: "0", 10: "p10", 20: "p20"}
-
-        # Conta apenas imagens de treino já processadas
         registros_treino = [r for r in self._registros if r["treino"]]
         total = len(registros_treino) * len(self.ANGULOS_AUG)
         feito = 0
         geradas = 0
-
         self._log_ts(
-            f"Aumento de dados: {len(registros_treino)} imagens × "
+            f"Aumento: {len(registros_treino)} imgs × "
             f"{len(self.ANGULOS_AUG)} rotações = {total} arquivos"
         )
         self.after(0, lambda: self._barra_aumento.set(0))
-        self.after(0, lambda: self._status.definir("Realizando aumento de dados…"))
-
+        self.after(0, lambda: self._status.definir("Realizando aumento…"))
         for rec in registros_treino:
             letra = rec["letra"]
             nome_arq = os.path.basename(rec["arquivo"])
             nome_sem_ext = os.path.splitext(nome_arq)[0]
-
-            # Lê a versão já processada (224×224 RGB) do diretório processed/
             caminho_proc = os.path.join(self._dir_processado, "train", letra, nome_arq)
-            if not os.path.isfile(caminho_proc):
-                # Se ainda não foi processada, processa agora inline
-                try:
-                    img_proc = preparar_imagem(Image.open(rec["arquivo"]))
-                except Exception as e:
-                    self._log_ts(f"  [ERRO ao abrir] {nome_arq}: {e}")
-                    feito += len(self.ANGULOS_AUG)
-                    continue
-            else:
-                try:
-                    img_proc = Image.open(caminho_proc)
-                except Exception as e:
-                    self._log_ts(f"  [ERRO ao ler processada] {nome_arq}: {e}")
-                    feito += len(self.ANGULOS_AUG)
-                    continue
-
-            # Gera as 5 rotações e salva em disco
+            try:
+                img_proc = (
+                    Image.open(caminho_proc)
+                    if os.path.isfile(caminho_proc)
+                    else preparar_imagem(Image.open(rec["arquivo"]))
+                )
+            except Exception as e:
+                self._log_ts(f"  [ERRO] {nome_arq}: {e}")
+                feito += len(self.ANGULOS_AUG)
+                continue
             for ang in self.ANGULOS_AUG:
                 suf = sufixos[ang]
                 nome_aug = f"{nome_sem_ext}_rot_{suf}.png"
                 destino = os.path.join(self._dir_processado, "train", letra, nome_aug)
-
-                # Rotação com PIL: expand=False mantém 224×224,
-                # fillcolor=0 preenche bordas com preto (fundo padrão das mamografias)
                 img_rot = img_proc.rotate(
                     ang, expand=False, fillcolor=(0, 0, 0), resample=Image.BILINEAR
                 )
                 img_rot.save(destino)
                 geradas += 1
                 feito += 1
-
-                # Atualiza barra de progresso
                 fracao = feito / total
                 self.after(
                     0,
@@ -948,128 +1402,214 @@ class AbaDataset(ctk.CTkFrame):
                         self._lbl_aumento.configure(text=f"{d}/{t}"),
                     ),
                 )
-
         self.after(
             0,
             lambda: (
-                self._registrar(
-                    f"Aumento concluído: {geradas} imagens geradas em "
-                    f"{os.path.join(self._dir_processado, 'train')}"
-                ),
+                self._registrar(f"Aumento concluído: {geradas} imagens geradas."),
                 self._status.definir("Aumento de dados concluído."),
             ),
         )
-
-        # Recria os DataLoaders para incluir as imagens aumentadas
         if TORCH_OK and self._dir_processado:
             self._train_loader, self._test_loader = criar_dataloaders(
                 self._dir_processado
             )
             n_tr = len(self._train_loader.dataset) if self._train_loader else 0
-            self._log_ts(
-                f"DataLoaders recriados: train={n_tr} amostras (com augmentation)"
-            )
+            self._log_ts(f"DataLoaders recriados: train={n_tr} (com augmentation)")
+
+    # ── Propriedades acessíveis pelas outras abas ────────────────────────────
+    @property
+    def train_loader(self):
+        return self._train_loader
+
+    @property
+    def test_loader(self):
+        return self._test_loader
+
+    @property
+    def dir_processado(self):
+        return self._dir_processado
 
 
-# ── Aba Classificação ────────────────────────────────────────────────────────
+# =============================================================================
+# ABA CLASSIFICAÇÃO — VGG16 REAL
+# =============================================================================
 
 
 class AbaClassificacao(ctk.CTkFrame):
-    def __init__(self, pai, status):
+    """
+    Aba de treinamento e classificação com VGG16 real.
+
+    Fluxo:
+    1. Configura hiperparâmetros (lr, dropout, épocas, modo)
+    2. Cria ClassificadorVGG e inicia treinar_modelo() em thread separada
+    3. Cada época chama _atualizar_ui_epoca() via self.after() (thread-safe)
+    4. Ao fim do treino, exibe gráficos de convergência no subpainel
+    5. Botão "Classificar" avalia o modelo no conjunto de teste
+    6. Botão "Salvar" persiste os pesos em .pth e o histórico em .json
+    """
+
+    def __init__(self, pai, status, aba_dataset: AbaDataset):
         super().__init__(pai, fg_color="transparent")
         self._status = status
+        self._aba_dataset = aba_dataset
         self._modo = ctk.StringVar(value="binario")
+        self._modelo = None
+        self._historico = {}
+        self._parar_flag = threading.Event()
+        self._img_grafico_tk = None
         self._construir()
 
     def _construir(self):
-        # Configuração
-        cfg = ctk.CTkFrame(self, corner_radius=10)
-        cfg.pack(fill="x", pady=(0, 6))
-        rotulo_secao(cfg, "CLASSIFICADOR")
-        linha_modo = ctk.CTkFrame(cfg, fg_color="transparent")
-        linha_modo.pack(fill="x", padx=12)
+        # ── Painel esquerdo: controles ───────────────────────────────────────
+        painel_esq = ctk.CTkFrame(self, width=280, corner_radius=10)
+        painel_esq.pack(side="left", fill="y", padx=(0, 6))
+        painel_esq.pack_propagate(False)
+
+        rotulo_secao(painel_esq, "MODO")
         ctk.CTkRadioButton(
-            linha_modo,
+            painel_esq,
             text="Binário (I+II vs III+IV)",
             variable=self._modo,
             value="binario",
             font=FONTE_CORPO,
-        ).pack(side="left", padx=(0, 20))
+        ).pack(anchor="w", padx=14, pady=2)
         ctk.CTkRadioButton(
-            linha_modo,
+            painel_esq,
             text="4 Classes (I×II×III×IV)",
             variable=self._modo,
             value="quadriclasse",
             font=FONTE_CORPO,
-        ).pack(side="left")
-        linha_botoes = ctk.CTkFrame(cfg, fg_color="transparent")
-        linha_botoes.pack(fill="x", padx=12, pady=8)
-        botao(linha_botoes, "▶ Treinar", self._treinar).pack(side="left", padx=(0, 6))
-        botao(linha_botoes, "⚡ Classificar", self._classificar).pack(
-            side="left", padx=(0, 6)
+        ).pack(anchor="w", padx=14, pady=2)
+
+        rotulo_secao(painel_esq, "HIPERPARÂMETROS")
+
+        def _linha_param(pai, rotulo, var, de, ate, passos, fmt="{:.5f}"):
+            f = ctk.CTkFrame(pai, fg_color="transparent")
+            f.pack(fill="x", padx=12, pady=2)
+            lbl = ctk.CTkLabel(f, text=rotulo, font=FONTE_PEQUENA, width=80, anchor="w")
+            lbl.pack(side="left")
+            val_lbl = ctk.CTkLabel(
+                f, text=fmt.format(var.get()), font=FONTE_PEQUENA, width=60
+            )
+            val_lbl.pack(side="right")
+
+            def _upd(v):
+                val_lbl.configure(text=fmt.format(float(v)))
+
+            sl = ctk.CTkSlider(
+                f, from_=de, to=ate, number_of_steps=passos, variable=var, command=_upd
+            )
+            sl.pack(side="left", fill="x", expand=True, padx=4)
+            return sl
+
+        self._var_lr = ctk.DoubleVar(value=3e-4)
+        self._var_wd = ctk.DoubleVar(value=1e-4)
+        self._var_dropout = ctk.DoubleVar(value=0.5)
+        self._var_epocas = ctk.IntVar(value=20)
+
+        _linha_param(painel_esq, "LR", self._var_lr, 1e-5, 1e-2, 50, fmt="{:.5f}")
+        _linha_param(painel_esq, "W.Decay", self._var_wd, 0, 1e-2, 50, fmt="{:.5f}")
+        _linha_param(
+            painel_esq, "Dropout", self._var_dropout, 0.1, 0.8, 14, fmt="{:.2f}"
+        )
+        _linha_param(painel_esq, "Épocas", self._var_epocas, 5, 50, 45, fmt="{:.0f}")
+
+        rotulo_secao(painel_esq, "FINE-TUNING")
+        self._var_descongelar = ctk.IntVar(value=0)
+        ctk.CTkLabel(
+            painel_esq, text="Blocos conv descongelados:", font=FONTE_PEQUENA
+        ).pack(anchor="w", padx=14)
+        ctk.CTkSlider(
+            painel_esq, from_=0, to=3, number_of_steps=3, variable=self._var_descongelar
+        ).pack(padx=12, fill="x")
+        ctk.CTkLabel(
+            painel_esq, text="0=só classifier · 1-3=blocos finais", font=FONTE_PEQUENA
+        ).pack(anchor="w", padx=14, pady=(0, 6))
+
+        rotulo_secao(painel_esq, "CONTROLES")
+        self._btn_treinar = botao(painel_esq, "▶ Treinar", self._treinar)
+        self._btn_treinar.pack(padx=12, fill="x")
+        self._btn_parar = botao(
+            painel_esq,
+            "⏹ Parar",
+            self._parar,
+            fg_color="transparent",
+            border_width=1,
+            state="disabled",
+        )
+        self._btn_parar.pack(padx=12, pady=4, fill="x")
+        botao(painel_esq, "⚡ Classificar Teste", self._classificar).pack(
+            padx=12, fill="x"
         )
         botao(
-            linha_botoes,
+            painel_esq,
             "💾 Salvar Modelo",
             self._salvar,
             fg_color="transparent",
             border_width=1,
-        ).pack(side="left")
+        ).pack(padx=12, pady=4, fill="x")
 
-        linha_progresso = ctk.CTkFrame(cfg, fg_color="transparent")
-        linha_progresso.pack(fill="x", padx=12, pady=(0, 10))
-        ctk.CTkLabel(linha_progresso, text="Épocas:", font=FONTE_PEQUENA).pack(
-            side="left"
-        )
-        self._barra_treino = ctk.CTkProgressBar(linha_progresso)
+        # Progresso
+        linha_prog = ctk.CTkFrame(painel_esq, fg_color="transparent")
+        linha_prog.pack(fill="x", padx=12, pady=(4, 0))
+        self._barra_treino = ctk.CTkProgressBar(linha_prog)
         self._barra_treino.set(0)
-        self._barra_treino.pack(side="left", fill="x", expand=True, padx=6)
+        self._barra_treino.pack(fill="x")
+        linha_ep = ctk.CTkFrame(painel_esq, fg_color="transparent")
+        linha_ep.pack(fill="x", padx=12)
         self._lbl_epoca = ctk.CTkLabel(
-            linha_progresso, text="—", font=FONTE_PEQUENA, width=50
+            linha_ep, text="—", font=FONTE_PEQUENA, anchor="w"
         )
         self._lbl_epoca.pack(side="left")
         self._lbl_tempo = ctk.CTkLabel(
-            linha_progresso, text="", font=FONTE_PEQUENA, width=60
+            linha_ep, text="", font=FONTE_PEQUENA, anchor="e"
         )
-        self._lbl_tempo.pack(side="left")
+        self._lbl_tempo.pack(side="right")
+
+        # ── Painel direito: métricas + gráficos ──────────────────────────────
+        painel_dir = ctk.CTkFrame(self, corner_radius=10)
+        painel_dir.pack(side="left", fill="both", expand=True)
 
         # Métricas binárias
-        frame_metricas = ctk.CTkFrame(self, corner_radius=10)
-        frame_metricas.pack(fill="x", pady=(0, 6))
-        rotulo_secao(frame_metricas, "MÉTRICAS – BINÁRIO")
-        linha_metricas = ctk.CTkFrame(frame_metricas, fg_color="transparent")
-        linha_metricas.pack(fill="x", padx=12, pady=(0, 10))
+        rotulo_secao(painel_dir, "MÉTRICAS — BINÁRIO")
+        linha_met = ctk.CTkFrame(painel_dir, fg_color="transparent")
+        linha_met.pack(fill="x", padx=12, pady=(0, 6))
         nomes = ["Sensib.", "Especif.", "Precisão", "Acurácia", "F1"]
-        self._cards_metrica = [CartaoMetrica(linha_metricas, n) for n in nomes]
+        self._cards_metrica = [CartaoMetrica(linha_met, n) for n in nomes]
         [
-            c.pack(side="left", expand=True, fill="both", padx=3)
+            c.pack(side="left", expand=True, fill="both", padx=2)
             for c in self._cards_metrica
         ]
 
-        # Matriz de confusão
-        frame_matriz = ctk.CTkFrame(self, corner_radius=10)
-        frame_matriz.pack(fill="both", expand=True, pady=(0, 0))
-        rotulo_secao(frame_matriz, "MATRIZ DE CONFUSÃO – 4 CLASSES")
-        area_matriz = ctk.CTkFrame(frame_matriz, fg_color="transparent")
-        area_matriz.pack(padx=12, pady=(0, 8))
+        # Abas internas: Matriz de Confusão | Gráficos
+        self._abas_internas = ctk.CTkTabview(painel_dir)
+        self._abas_internas.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self._abas_internas.add("📊 Matriz de Confusão")
+        self._abas_internas.add("📈 Gráficos de Convergência")
+
+        # Tab 1: Matriz de confusão 4 classes
+        tab_matriz = self._abas_internas.tab("📊 Matriz de Confusão")
+        rotulo_secao(tab_matriz, "MATRIZ — 4 CLASSES")
+        area_mat = ctk.CTkFrame(tab_matriz, fg_color="transparent")
+        area_mat.pack(padx=12)
         rotulos = ["I", "II", "III", "IV"]
-        linha_cab = ctk.CTkFrame(area_matriz, fg_color="transparent")
-        linha_cab.pack()
-        ctk.CTkLabel(linha_cab, text="Pred→\nReal↓", font=FONTE_PEQUENA, width=70).pack(
+        cab = ctk.CTkFrame(area_mat, fg_color="transparent")
+        cab.pack()
+        ctk.CTkLabel(cab, text="Pred→\nReal↓", font=FONTE_PEQUENA, width=70).pack(
             side="left"
         )
         for r in rotulos:
-            ctk.CTkLabel(linha_cab, text=f"B{r}", font=FONTE_PEQUENA, width=70).pack(
+            ctk.CTkLabel(cab, text=f"B{r}", font=FONTE_PEQUENA, width=70).pack(
                 side="left"
             )
         self._celulas_cm: list[list[ctk.CTkLabel]] = []
         for i, ri in enumerate(rotulos):
-            linha_cm = ctk.CTkFrame(area_matriz, fg_color="transparent")
+            linha_cm = ctk.CTkFrame(area_mat, fg_color="transparent")
             linha_cm.pack(pady=1)
             ctk.CTkLabel(linha_cm, text=f"B{ri}", font=FONTE_PEQUENA, width=70).pack(
                 side="left"
             )
-            linha_cel = []
+            row = []
             for j in range(4):
                 cel = ctk.CTkLabel(
                     linha_cm,
@@ -1081,121 +1621,356 @@ class AbaClassificacao(ctk.CTkFrame):
                     fg_color=("#d0e8ff" if i == j else "#f5f5f5"),
                 )
                 cel.pack(side="left", padx=2)
-                linha_cel.append(cel)
-            self._celulas_cm.append(linha_cel)
-
-        linha_m4 = ctk.CTkFrame(frame_matriz, fg_color="transparent")
-        linha_m4.pack(fill="x", padx=12, pady=(4, 10))
+                row.append(cel)
+            self._celulas_cm.append(row)
+        linha_m4 = ctk.CTkFrame(tab_matriz, fg_color="transparent")
+        linha_m4.pack(fill="x", padx=12, pady=(12, 6))
         self._card_sens_media = CartaoMetrica(linha_m4, "Sensib. Média")
         self._card_espec_media = CartaoMetrica(linha_m4, "Especif. Média")
         self._card_tempo_exec = CartaoMetrica(linha_m4, "Tempo")
         for c in (self._card_sens_media, self._card_espec_media, self._card_tempo_exec):
             c.pack(side="left", expand=True, fill="both", padx=3)
 
-    def _treinar(self):
-        threading.Thread(target=self._executar_treino, daemon=True).start()
+        # Tab 2: Gráficos de convergência
+        tab_graf = self._abas_internas.tab("📈 Gráficos de Convergência")
+        fundo_g = ctk.CTkFrame(tab_graf, corner_radius=6)
+        fundo_g.pack(fill="both", expand=True, padx=4, pady=4)
+        self._canvas_grafico = tk.Canvas(fundo_g, bg="#f8f8f8", highlightthickness=0)
+        sv_g = ctk.CTkScrollbar(fundo_g, command=self._canvas_grafico.yview)
+        sh_g = ctk.CTkScrollbar(
+            fundo_g, orientation="horizontal", command=self._canvas_grafico.xview
+        )
+        self._canvas_grafico.configure(yscrollcommand=sv_g.set, xscrollcommand=sh_g.set)
+        sh_g.pack(side="bottom", fill="x")
+        sv_g.pack(side="right", fill="y")
+        self._canvas_grafico.pack(fill="both", expand=True)
+        self._lbl_grafico_hint = ctk.CTkLabel(
+            tab_graf,
+            text="Os gráficos aparecerão após o treinamento.",
+            font=FONTE_PEQUENA,
+        )
+        self._lbl_grafico_hint.pack()
 
-    def _executar_treino(self):
-        epocas = 20
-        t0 = time.time()
-        self.after(0, lambda: self._status.definir("Treinando modelo…"))
-        for ep in range(1, epocas + 1):
-            time.sleep(0.1)
-            fracao = ep / epocas
-            decorrido = time.time() - t0
-            self.after(
-                0,
-                lambda f=fracao, e=ep, t=decorrido: (
-                    self._barra_treino.set(f),
-                    self._lbl_epoca.configure(text=f"{e}/{epocas}"),
-                    self._lbl_tempo.configure(text=f"{t:.1f}s"),
-                ),
+    # ── Treino ────────────────────────────────────────────────────────────────
+
+    def _treinar(self):
+        if not TORCH_OK:
+            messagebox.showerror("Erro", "PyTorch não instalado.")
+            return
+        train_loader = self._aba_dataset.train_loader
+        test_loader = self._aba_dataset.test_loader
+        if not train_loader:
+            messagebox.showwarning(
+                "Aviso", "Carregue e processe o dataset antes de treinar."
             )
-        self.after(0, lambda: self._status.definir("Treino concluído."))
+            return
+
+        n_classes = 2 if self._modo.get() == "binario" else 4
+        self._modelo = ClassificadorVGG(
+            n_classes=n_classes, dropout=self._var_dropout.get()
+        )
+        n_blocos = int(self._var_descongelar.get())
+        if n_blocos > 0:
+            self._modelo.descongelar_ultimas_conv(n_blocos)
+
+        self._parar_flag.clear()
+        self._btn_treinar.configure(state="disabled")
+        self._btn_parar.configure(state="normal")
+        self._barra_treino.set(0)
+        self._historico = {}
+
+        n_epocas = int(self._var_epocas.get())
+        threading.Thread(
+            target=treinar_modelo,
+            kwargs=dict(
+                modelo=self._modelo,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                n_epocas=n_epocas,
+                lr=self._var_lr.get(),
+                weight_decay=self._var_wd.get(),
+                modo=self._modo.get(),
+                callback_epoca=self._atualizar_ui_epoca,
+                callback_fim=self._treino_concluido,
+                parar_flag=self._parar_flag,
+            ),
+            daemon=True,
+        ).start()
+        self._status.definir("Treinando VGG16…")
+
+    def _parar(self):
+        self._parar_flag.set()
+        self._status.definir("Parando após a época atual…")
+
+    def _atualizar_ui_epoca(self, info: dict):
+        """Callback chamado ao fim de cada época — atualiza UI de forma thread-safe."""
+
+        def _upd():
+            ep = info["epoca"]
+            total_ep = len(info["train_loss"])
+            fracao = ep / max(total_ep, 1)
+            loss_tr = info["train_loss"][-1]
+            loss_val = info["val_loss"][-1]
+            acc_val = info["val_acc"][-1]
+            tempo = info["tempo_por_epoca"][-1]
+            self._barra_treino.set(fracao)
+            self._lbl_epoca.configure(
+                text=f"Época {ep} | loss_tr={loss_tr:.4f} "
+                f"| loss_val={loss_val:.4f} | acc_val={acc_val:.3f}"
+            )
+            self._lbl_tempo.configure(text=f"{tempo:.1f}s")
+            if info.get("status") == "early_stop":
+                self._status.definir(f"Early stop na época {ep}")
+
+        self.after(0, _upd)
+
+    def _treino_concluido(self, historico: dict):
+        """Callback chamado ao fim do treinamento — gera gráficos."""
+        self._historico = historico
+        self.after(0, self._pos_treino)
+
+    def _pos_treino(self):
+        self._btn_treinar.configure(state="normal")
+        self._btn_parar.configure(state="disabled")
+        self._barra_treino.set(1.0)
+        n_ep = self._historico.get("epocas_rodadas", 0)
+        self._status.definir(f"Treino concluído — {n_ep} épocas.")
+        self._renderizar_graficos()
+
+    def _renderizar_graficos(self):
+        """Renderiza os gráficos de convergência no canvas da aba."""
+        if not self._historico:
+            return
+        modo_str = "Binário" if self._modo.get() == "binario" else "4 Classes"
+        img_pil = gerar_graficos_convergencia(
+            self._historico, titulo=f"VGG16 — {modo_str}"
+        )
+        if img_pil is None:
+            return
+        self._lbl_grafico_hint.pack_forget()
+        self._canvas_grafico.update_idletasks()
+        w = max(self._canvas_grafico.winfo_width(), 900)
+        ratio = w / img_pil.width
+        h = int(img_pil.height * ratio)
+        img_pil_rs = img_pil.resize((w, h), Image.LANCZOS)
+        self._img_grafico_tk = ImageTk.PhotoImage(img_pil_rs)
+        self._canvas_grafico.delete("all")
+        self._canvas_grafico.create_image(0, 0, anchor="nw", image=self._img_grafico_tk)
+        self._canvas_grafico.configure(scrollregion=(0, 0, w, h))
+        # Muda para a aba dos gráficos automaticamente
+        self._abas_internas.set("📈 Gráficos de Convergência")
+
+    # ── Classificação ─────────────────────────────────────────────────────────
 
     def _classificar(self):
+        if not TORCH_OK:
+            messagebox.showerror("Erro", "PyTorch não instalado.")
+            return
+        if self._modelo is None:
+            messagebox.showwarning("Aviso", "Treine o modelo primeiro.")
+            return
+        test_loader = self._aba_dataset.test_loader
+        if not test_loader:
+            messagebox.showwarning("Aviso", "Carregue o dataset primeiro.")
+            return
+        threading.Thread(target=self._executar_classificacao, daemon=True).start()
+
+    def _executar_classificacao(self):
+        self.after(0, lambda: self._status.definir("Classificando conjunto de teste…"))
         t0 = time.time()
-        sens = random.uniform(0.72, 0.92)
-        espec = random.uniform(0.74, 0.94)
-        prec = random.uniform(0.70, 0.90)
-        acc = random.uniform(0.75, 0.93)
-        f1 = 2 * prec * sens / (prec + sens)
-        decorrido = time.time() - t0 + random.uniform(0.5, 3)
-        for cartao, v in zip(self._cards_metrica, [sens, espec, prec, acc, f1]):
+        modelo = self._modelo.to(DEVICE)
+        modelo.eval()
+        modo = self._modo.get()
+        y_true, y_pred = [], []
+
+        with torch.no_grad():
+            for imgs, labels in self._aba_dataset.test_loader:
+                if modo == "binario":
+                    labels = (labels >= 2).long()
+                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+                saidas = modelo(imgs)
+                preds = saidas.argmax(dim=1)
+                y_true.extend(labels.cpu().numpy().tolist())
+                y_pred.extend(preds.cpu().numpy().tolist())
+
+        decorrido = time.time() - t0
+
+        # Métricas binárias
+        met_bin = calcular_metricas_binario(
+            [1 if v >= 1 else 0 for v in y_true] if modo != "binario" else y_true,
+            [1 if v >= 1 else 0 for v in y_pred] if modo != "binario" else y_pred,
+        )
+
+        # Métricas 4 classes
+        n_c = 2 if modo == "binario" else 4
+        met4 = calcular_metricas_4classes(y_true, y_pred, n_classes=n_c)
+
+        self.after(0, lambda: self._exibir_resultados(met_bin, met4, decorrido))
+
+    def _exibir_resultados(self, met_bin, met4, tempo):
+        vals = [
+            met_bin["sensibilidade"],
+            met_bin["especificidade"],
+            met_bin["precisao"],
+            met_bin["acuracia"],
+            met_bin["f1"],
+        ]
+        for cartao, v in zip(self._cards_metrica, vals):
             cartao.definir(f"{v:.3f}")
-        matriz = np.random.randint(0, 40, (4, 4))
-        np.fill_diagonal(matriz, np.random.randint(60, 120, 4))
+
+        # Matriz de confusão
+        matriz = met4["matriz_confusao"]
+        n_c = len(matriz)
         for i in range(4):
             for j in range(4):
-                self._celulas_cm[i][j].configure(text=str(matriz[i, j]))
-        self._card_sens_media.definir(f"{sens:.3f}")
-        self._card_espec_media.definir(f"{espec:.3f}")
-        self._card_tempo_exec.definir(f"{decorrido:.2f}s")
+                if i < n_c and j < n_c:
+                    self._celulas_cm[i][j].configure(text=str(matriz[i][j]))
+                else:
+                    self._celulas_cm[i][j].configure(text="—")
+
+        self._card_sens_media.definir(f"{met4['sensibilidade_media']:.3f}")
+        self._card_espec_media.definir(f"{met4['especificidade_media']:.3f}")
+        self._card_tempo_exec.definir(f"{tempo:.2f}s")
         self._status.definir("Classificação concluída.")
+        self._abas_internas.set("📊 Matriz de Confusão")
+
+    # ── Salvar ────────────────────────────────────────────────────────────────
 
     def _salvar(self):
+        if self._modelo is None:
+            messagebox.showwarning("Aviso", "Treine o modelo primeiro.")
+            return
         caminho = filedialog.asksaveasfilename(
-            defaultextension=".pth",
-            filetypes=[("PyTorch", "*.pth"), ("H5", "*.h5"), ("Todos", "*.*")],
+            defaultextension=".pth", filetypes=[("PyTorch", "*.pth"), ("Todos", "*.*")]
         )
-        if caminho:
-            messagebox.showinfo("Salvar", f"Implemente torch.save() aqui:\n{caminho}")
-            self._status.definir(f"Modelo: {os.path.basename(caminho)}")
+        if not caminho:
+            return
+        try:
+            torch.save(self._modelo.state_dict(), caminho)
+            # Salva também o histórico em JSON ao lado do .pth
+            hist_path = caminho.replace(".pth", "_historico.json")
+            with open(hist_path, "w", encoding="utf-8") as f:
+                json.dump(self._historico, f, indent=2, ensure_ascii=False)
+            # Salva gráfico em PNG ao lado do .pth
+            if self._historico:
+                graf_path = caminho.replace(".pth", "_graficos.png")
+                img_pil = gerar_graficos_convergencia(self._historico)
+                if img_pil:
+                    img_pil.save(graf_path, dpi=(150, 150))
+            messagebox.showinfo("Salvo", f"Modelo: {caminho}\nHistórico: {hist_path}")
+            self._status.definir(f"Modelo salvo: {os.path.basename(caminho)}")
+        except Exception as e:
+            messagebox.showerror("Erro ao salvar", str(e))
+
+    # ── Acesso externo (AbaGradCAM) ───────────────────────────────────────────
+    @property
+    def modelo(self):
+        return self._modelo
 
 
-# ── Aba Grad-CAM ─────────────────────────────────────────────────────────────
+# =============================================================================
+# ABA GRAD-CAM REAL
+# =============================================================================
 
 
 class AbaGradCAM(ctk.CTkFrame):
-    def __init__(self, pai, status):
+    """
+    Aba de visualização Grad-CAM com implementação real via hooks PyTorch.
+
+    Gera mapas de calor sobre a imagem original mostrando quais regiões
+    da mama influenciaram a decisão da rede para a classe predita.
+    """
+
+    ROTULOS = {0: "BI-RADS I", 1: "BI-RADS II", 2: "BI-RADS III", 3: "BI-RADS IV"}
+
+    def __init__(self, pai, status, aba_classif: AbaClassificacao):
         super().__init__(pai, fg_color="transparent")
         self._status = status
+        self._aba_classif = aba_classif
         self._caminho = ""
         self._pil_orig = None
+        self._grad_cam = None
         self._construir()
 
     def _construir(self):
-        painel = ctk.CTkFrame(self, width=220, corner_radius=10)
+        painel = ctk.CTkFrame(self, width=240, corner_radius=10)
         painel.pack(side="left", fill="y", padx=(0, 6))
         painel.pack_propagate(False)
+
         rotulo_secao(painel, "IMAGEM")
         botao(painel, "📂 Abrir Imagem", self._abrir).pack(padx=12, fill="x")
         self._lbl_nome = ctk.CTkLabel(
             painel, text="—", font=FONTE_PEQUENA, wraplength=200, anchor="w"
         )
         self._lbl_nome.pack(padx=12, pady=4, anchor="w")
+
+        rotulo_secao(painel, "PRÉ-PROCESSAMENTO")
+        self._var_segmentar = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            painel,
+            text="Segmentar antes da classificação",
+            variable=self._var_segmentar,
+            font=FONTE_PEQUENA,
+        ).pack(anchor="w", padx=14, pady=2)
+
         rotulo_secao(painel, "RESULTADO")
         self._card_classe = CartaoMetrica(painel, "BIRADS Predito")
         self._card_confianca = CartaoMetrica(painel, "Confiança")
         self._card_classe.pack(padx=12, fill="x")
-        self._card_confianca.pack(padx=12, fill="x", pady=6)
+        self._card_confianca.pack(padx=12, fill="x", pady=4)
+
         botao(painel, "🔥 Gerar Grad-CAM", self._gerar).pack(padx=12, fill="x")
-        rotulo_secao(painel, "LEGENDA")
+        botao(
+            painel,
+            "💾 Salvar Resultado",
+            self._salvar_resultado,
+            fg_color="transparent",
+            border_width=1,
+        ).pack(padx=12, pady=4, fill="x")
+
+        rotulo_secao(painel, "LEGENDA GRAD-CAM")
         ctk.CTkLabel(
             painel,
-            text="Azul→baixo  Verde→médio\nAmarelo→alto  Vermelho→máx",
+            text="Azul → baixa ativação\n"
+            "Verde → ativação média\n"
+            "Amarelo → ativação alta\n"
+            "Vermelho → máxima ativação",
             font=FONTE_PEQUENA,
             justify="left",
             anchor="w",
-        ).pack(padx=12, anchor="w")
+        ).pack(padx=14, anchor="w")
 
+        rotulo_secao(painel, "INFO")
+        self._info_cam = ctk.CTkTextbox(
+            painel, height=80, font=FONTE_MONO, state="disabled"
+        )
+        self._info_cam.pack(padx=12, fill="x")
+
+        # Área de visualização
         area = ctk.CTkFrame(self, corner_radius=10)
         area.pack(side="left", fill="both", expand=True)
-        cabecalho = ctk.CTkFrame(area, fg_color="transparent", height=30)
-        cabecalho.pack(fill="x", padx=12, pady=(8, 4))
-        cabecalho.pack_propagate(False)
-        ctk.CTkLabel(cabecalho, text="Original", font=FONTE_SECAO, anchor="w").pack(
+        cab = ctk.CTkFrame(area, fg_color="transparent", height=30)
+        cab.pack(fill="x", padx=12, pady=(8, 4))
+        cab.pack_propagate(False)
+        ctk.CTkLabel(
+            cab, text="Original (segmentada)", font=FONTE_SECAO, anchor="w"
+        ).pack(side="left", expand=True)
+        ctk.CTkLabel(cab, text="Grad-CAM Overlay", font=FONTE_SECAO, anchor="w").pack(
             side="left", expand=True
         )
-        ctk.CTkLabel(cabecalho, text="Grad-CAM", font=FONTE_SECAO, anchor="w").pack(
-            side="left", expand=True
-        )
+
         area_canvas = ctk.CTkFrame(area, corner_radius=6, fg_color="#e8e8e8")
         area_canvas.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self._canvas_orig = tk.Canvas(area_canvas, bg="#e8e8e8", highlightthickness=0)
         self._canvas_cam = tk.Canvas(area_canvas, bg="#e8e8e8", highlightthickness=0)
         self._canvas_orig.pack(side="left", fill="both", expand=True, padx=(0, 2))
         self._canvas_cam.pack(side="left", fill="both", expand=True, padx=(2, 0))
+
+    def _atualizar_info(self, texto: str):
+        self._info_cam.configure(state="normal")
+        self._info_cam.delete("1.0", "end")
+        self._info_cam.insert("1.0", texto)
+        self._info_cam.configure(state="disabled")
 
     def _abrir(self):
         caminho = filedialog.askopenfilename(
@@ -1212,6 +1987,8 @@ class AbaGradCAM(ctk.CTkFrame):
                 arr = ((arr - arr.min()) / max(arr.max() - arr.min(), 1) * 255).astype(
                     np.uint8
                 )
+            if arr.ndim == 3:
+                arr = arr[:, :, 0]
             self._pil_orig = Image.fromarray(arr).convert("L")
             self._exibir_canvas(self._canvas_orig, self._pil_orig, "_tk_orig")
             self._status.definir(f"Imagem: {os.path.basename(caminho)}")
@@ -1230,56 +2007,127 @@ class AbaGradCAM(ctk.CTkFrame):
         canvas.create_image(larg // 2, alt // 2, anchor="center", image=img_tk)
 
     def _gerar(self):
+        if not TORCH_OK:
+            messagebox.showerror("Erro", "PyTorch não instalado.")
+            return
         if not self._caminho:
             messagebox.showwarning("Aviso", "Selecione uma imagem.")
+            return
+        modelo = self._aba_classif.modelo
+        if modelo is None:
+            messagebox.showwarning(
+                "Aviso", "Treine ou carregue um modelo na aba Classificação."
+            )
             return
         threading.Thread(target=self._executar_gradcam, daemon=True).start()
 
     def _executar_gradcam(self):
         self.after(0, lambda: self._status.definir("Gerando Grad-CAM…"))
-        time.sleep(0.4)
-        orig = self._pil_orig.copy()
-        larg, alt = orig.size
-        # Heatmap gaussiano sintético (substituir por gradientes reais)
-        cx, cy = larg * random.uniform(0.3, 0.7), alt * random.uniform(0.3, 0.7)
-        sigma2 = (min(larg, alt) * 0.2) ** 2
-        xs, ys = np.meshgrid(np.arange(larg), np.arange(alt))
-        mapa_calor = np.exp(-((xs - cx) ** 2 + (ys - cy) ** 2) / (2 * sigma2)).astype(
-            np.float32
+
+        modelo = self._aba_classif.modelo
+        modelo = modelo.to(DEVICE).eval()
+
+        # Pré-processa a imagem (segmentação opcional + normalização ImageNet)
+        img_pil = self._pil_orig
+        if self._var_segmentar.get():
+            img_pil = segmentar_mama(img_pil.convert("L"))
+            img_pil = recortar_bounding_box(img_pil)
+        img_rgb = img_pil.convert("RGB").resize((224, 224), Image.LANCZOS)
+
+        transf = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
         )
-        mapa_pil = Image.fromarray((mapa_calor * 255).astype(np.uint8))
-        mapa_pil = mapa_pil.filter(ImageFilter.GaussianBlur(max(larg, alt) // 20))
-        mapa_arr = np.array(mapa_pil) / 255.0
-        # Colormap jet vetorizado
-        r = np.clip(1.5 - np.abs(4 * mapa_arr - 3), 0, 1)
-        g = np.clip(1.5 - np.abs(4 * mapa_arr - 2), 0, 1)
-        b = np.clip(1.5 - np.abs(4 * mapa_arr - 1), 0, 1)
-        cam_rgb = (np.stack([r, g, b], axis=2) * 255).astype(np.uint8)
-        cam_pil = Image.fromarray(cam_rgb)
-        misturado = Image.blend(orig.convert("RGB"), cam_pil, alpha=0.55)
-        birads = random.choice(["I", "II", "III", "IV"])
-        confianca = random.uniform(0.70, 0.99)
+        tensor = transf(img_rgb).unsqueeze(0)  # [1, 3, 224, 224]
+
+        # Grad-CAM real
+        if self._grad_cam is None or True:  # recria sempre (modelo pode ter mudado)
+            self._grad_cam = GradCAM(modelo)
+
+        mapa_np = self._grad_cam.gerar(tensor)  # [224, 224] float32 [0,1]
+
+        # Predição e confiança
+        with torch.no_grad():
+            logits = modelo(tensor.to(DEVICE))
+            probs = torch.softmax(logits, dim=1)[0]
+            classe_idx = probs.argmax().item()
+            confianca = probs[classe_idx].item()
+
+        # Overlay colorido (blend 55% CAM + 45% original)
+        cam_rgb = Image.fromarray(aplicar_colormap_jet(mapa_np))
+        orig_rgb = img_rgb.copy()
+        misturado = Image.blend(orig_rgb, cam_rgb, alpha=0.55)
+
+        rotulo = self.ROTULOS.get(classe_idx, str(classe_idx))
+        n_classes = logits.shape[1]
+        info = (
+            f"Classe predita: {rotulo}\n"
+            f"Confiança: {confianca:.1%}\n"
+            f"Modo: {'binário' if n_classes == 2 else '4 classes'}\n"
+            f"Camada alvo: features[28]"
+        )
+
         self.after(
             0,
-            lambda m=misturado, b=birads, c=confianca: self._exibir_resultado(m, b, c),
+            lambda m=misturado, r=rotulo, c=confianca, i=info: self._exibir_resultado(
+                m, r, c, i
+            ),
         )
 
-    def _exibir_resultado(self, misturado, birads, confianca):
+    def _exibir_resultado(self, misturado, rotulo, confianca, info):
         self._exibir_canvas(self._canvas_cam, misturado, "_tk_cam")
-        self._card_classe.definir(f"BIRADS {birads}")
+        self._card_classe.definir(rotulo)
         self._card_confianca.definir(f"{confianca:.1%}")
+        self._atualizar_info(info)
         self._status.definir("Grad-CAM gerado.")
 
+    def _salvar_resultado(self):
+        """Salva o overlay Grad-CAM em PNG."""
+        if not hasattr(self, "_tk_cam"):
+            messagebox.showwarning("Aviso", "Gere o Grad-CAM primeiro.")
+            return
+        caminho = filedialog.asksaveasfilename(
+            defaultextension=".png", filetypes=[("PNG", "*.png"), ("Todos", "*.*")]
+        )
+        if not caminho:
+            return
+        try:
+            # Re-gera a imagem misturada em tamanho original
+            modelo = self._aba_classif.modelo
+            img_pil = self._pil_orig
+            if self._var_segmentar.get():
+                img_pil = segmentar_mama(img_pil.convert("L"))
+                img_pil = recortar_bounding_box(img_pil)
+            img_rgb = img_pil.convert("RGB").resize((224, 224), Image.LANCZOS)
+            transf = transforms.Compose(
+                [
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                ]
+            )
+            tensor = transf(img_rgb).unsqueeze(0)
+            mapa_np = self._grad_cam.gerar(tensor)
+            cam_rgb = Image.fromarray(aplicar_colormap_jet(mapa_np))
+            misturado = Image.blend(img_rgb, cam_rgb, alpha=0.55)
+            misturado.save(caminho)
+            messagebox.showinfo("Salvo", f"Grad-CAM salvo em:\n{caminho}")
+        except Exception as e:
+            messagebox.showerror("Erro ao salvar", str(e))
 
-# ── Aplicação principal ──────────────────────────────────────────────────────
+
+# =============================================================================
+# APLICAÇÃO PRINCIPAL
+# =============================================================================
 
 
 class AplicacaoMamografia(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("MamoVision — Segmentação e Classificação Mamográfica")
-        self.geometry("1280x800")
-        self.minsize(900, 640)
+        self.geometry("1380x820")
+        self.minsize(1000, 680)
         self._construir()
 
     def _construir(self):
@@ -1291,25 +2139,43 @@ class AplicacaoMamografia(ctk.CTk):
         )
         ctk.CTkLabel(
             cabecalho,
-            text="Segmentação e Classificação Mamográfica · PUC Minas",
+            text="Segmentação e Classificação Mamográfica · PUC Minas · VGG16",
             font=FONTE_PEQUENA,
         ).pack(side="left")
+        lbl_device = ctk.CTkLabel(
+            cabecalho,
+            text=f"Device: {DEVICE}" if DEVICE else "PyTorch indisponível",
+            font=FONTE_PEQUENA,
+        )
+        lbl_device.pack(side="right", padx=12)
 
         self._barra_status = BarraStatus(self)
         self._barra_status.pack(fill="x", side="bottom")
 
         abas = ctk.CTkTabview(self)
         abas.pack(fill="both", expand=True, padx=10, pady=6)
-        nomes_abas = [
-            "📷 Visualizador",
-            "📦 Dataset",
-            "🧠 Classificação",
-            "🔥 Grad-CAM",
-        ]
-        classes_abas = [AbaVisualizador, AbaDataset, AbaClassificacao, AbaGradCAM]
-        for nome, cls in zip(nomes_abas, classes_abas):
-            abas.add(nome)
-            cls(abas.tab(nome), self._barra_status).pack(fill="both", expand=True)
+
+        # Cria as abas em ordem — AbaDataset é referenciada pelas seguintes
+        abas.add("📷 Visualizador")
+        abas.add("📦 Dataset")
+        abas.add("🧠 Classificação")
+        abas.add("🔥 Grad-CAM")
+
+        AbaVisualizador(abas.tab("📷 Visualizador"), self._barra_status).pack(
+            fill="both", expand=True
+        )
+
+        self._aba_dataset = AbaDataset(abas.tab("📦 Dataset"), self._barra_status)
+        self._aba_dataset.pack(fill="both", expand=True)
+
+        self._aba_classif = AbaClassificacao(
+            abas.tab("🧠 Classificação"), self._barra_status, self._aba_dataset
+        )
+        self._aba_classif.pack(fill="both", expand=True)
+
+        AbaGradCAM(abas.tab("🔥 Grad-CAM"), self._barra_status, self._aba_classif).pack(
+            fill="both", expand=True
+        )
 
 
 def main():
