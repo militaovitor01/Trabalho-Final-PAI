@@ -407,6 +407,103 @@ class ClassificadorVGG(nn.Module):
 
 
 # =============================================================================
+# MODELO DENSENET121 — Transfer Learning
+# =============================================================================
+
+
+class ClassificadorDenseNet(nn.Module):
+    """
+    DenseNet121 com transfer learning para classificação BIRADS.
+
+    Arquitetura:
+    - Backbone: DenseNet121 pré-treinada no ImageNet, congelada inicialmente.
+    - Classifier substituído:
+        Linear(num_features → 512) → ReLU → Dropout → Linear(512 → n_classes)
+
+    Parâmetros:
+    - n_classes: 2 (binário I+II vs III+IV) ou 4 (quadriclasse I×II×III×IV)
+    - dropout: taxa de dropout no classificador final
+    """
+
+    def __init__(self, n_classes: int = 4, dropout: float = 0.5):
+        super().__init__()
+
+        # 1. Carrega a DenseNet121 com pesos pré-treinados no ImageNet
+        base = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
+
+        # 2. Congela a parte convolucional para treinar primeiro só a cabeça nova
+        for param in base.features.parameters():
+            param.requires_grad = False
+
+        # 3. Guarda o backbone convolucional
+        self.features = base.features
+
+        # 4. Captura o tamanho do vetor de características que sai da DenseNet
+        # Na DenseNet121, normalmente é 1024.
+        num_features = base.classifier.in_features
+
+        # 5. Substitui a cabeça original de 1000 classes por uma cabeça BIRADS
+        self.classifier = nn.Sequential(
+            nn.Linear(num_features, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(512, n_classes),
+        )
+
+    def forward(self, x):
+        # Passa a imagem pelas camadas convolucionais da DenseNet
+        x = self.features(x)
+
+        # A DenseNet original aplica ReLU antes do pooling global
+        x = torch.relu(x)
+
+        # Pooling global: [batch, canais, altura, largura] → [batch, canais, 1, 1]
+        x = nn.functional.adaptive_avg_pool2d(x, (1, 1))
+
+        # Achata: [batch, canais, 1, 1] → [batch, canais]
+        x = torch.flatten(x, 1)
+
+        # Classificador final: [batch, canais] → [batch, n_classes]
+        return self.classifier(x)
+
+    def descongelar_ultimas_conv(self, n_blocos: int = 1):
+        """
+        Descongela os últimos blocos da DenseNet para fine-tuning parcial.
+
+        n_blocos=0 → mantém tudo congelado
+        n_blocos=1 → descongela denseblock4 + norm5
+        n_blocos=2 → descongela denseblock3 + transition3 + denseblock4 + norm5
+        n_blocos=3 → descongela denseblock2 em diante
+        """
+        if n_blocos <= 0:
+            return
+
+        blocos = [
+            ["denseblock4", "norm5"],
+            ["denseblock3", "transition3", "denseblock4", "norm5"],
+            ["denseblock2", "transition2", "denseblock3", "transition3", "denseblock4", "norm5"],
+        ]
+
+        nomes_para_descongelar = blocos[min(n_blocos, 3) - 1]
+
+        for nome, modulo in self.features.named_children():
+            if nome in nomes_para_descongelar:
+                for param in modulo.parameters():
+                    param.requires_grad = True
+
+
+def camada_alvo_gradcam(modelo: nn.Module):
+    """Escolhe automaticamente uma camada alvo adequada para Grad-CAM."""
+    if isinstance(modelo, ClassificadorVGG):
+        return modelo.features[28], "VGG16 features[28]"
+    if isinstance(modelo, ClassificadorDenseNet):
+        return modelo.features.norm5, "DenseNet121 features.norm5"
+    if hasattr(modelo, "features"):
+        return modelo.features[-1], "features[-1]"
+    raise ValueError("Não foi possível definir a camada alvo do Grad-CAM para este modelo.")
+
+
+# =============================================================================
 # FUNÇÕES DE MÉTRICAS
 # =============================================================================
 
@@ -712,9 +809,13 @@ class GradCAM:
         self._gradientes = None
         self._hooks = []
 
-        # VGG16: última camada conv é features[28] (Conv2d 512→512, 3×3)
+        # Escolhe camada alvo automaticamente:
+        # VGG16 → features[28]
+        # DenseNet121 → features.norm5
         if camada_alvo is None:
-            camada_alvo = modelo.features[28]
+            camada_alvo, self.nome_camada_alvo = camada_alvo_gradcam(modelo)
+        else:
+            self.nome_camada_alvo = str(camada_alvo)
 
         # Hook forward: captura ativações A^k após a camada alvo
         self._hooks.append(camada_alvo.register_forward_hook(self._salvar_ativacoes))
@@ -1453,6 +1554,7 @@ class AbaClassificacao(ctk.CTkFrame):
         self._status = status
         self._aba_dataset = aba_dataset
         self._modo = ctk.StringVar(value="binario")
+        self._modelo_nome = ctk.StringVar(value="vgg")
         self._modelo = None
         self._historico = {}
         self._parar_flag = threading.Event()
@@ -1478,6 +1580,22 @@ class AbaClassificacao(ctk.CTkFrame):
             text="4 Classes (I×II×III×IV)",
             variable=self._modo,
             value="quadriclasse",
+            font=FONTE_CORPO,
+        ).pack(anchor="w", padx=14, pady=2)
+
+        rotulo_secao(painel_esq, "MODELO")
+        ctk.CTkRadioButton(
+            painel_esq,
+            text="VGG16",
+            variable=self._modelo_nome,
+            value="vgg",
+            font=FONTE_CORPO,
+        ).pack(anchor="w", padx=14, pady=2)
+        ctk.CTkRadioButton(
+            painel_esq,
+            text="DenseNet121",
+            variable=self._modelo_nome,
+            value="densenet",
             font=FONTE_CORPO,
         ).pack(anchor="w", padx=14, pady=2)
 
@@ -1666,9 +1784,17 @@ class AbaClassificacao(ctk.CTkFrame):
             return
 
         n_classes = 2 if self._modo.get() == "binario" else 4
-        self._modelo = ClassificadorVGG(
-            n_classes=n_classes, dropout=self._var_dropout.get()
-        )
+        nome_modelo = self._modelo_nome.get()
+
+        if nome_modelo == "vgg":
+            self._modelo = ClassificadorVGG(
+                n_classes=n_classes, dropout=self._var_dropout.get()
+            )
+        else:
+            self._modelo = ClassificadorDenseNet(
+                n_classes=n_classes, dropout=self._var_dropout.get()
+            )
+
         n_blocos = int(self._var_descongelar.get())
         if n_blocos > 0:
             self._modelo.descongelar_ultimas_conv(n_blocos)
@@ -1696,7 +1822,8 @@ class AbaClassificacao(ctk.CTkFrame):
             ),
             daemon=True,
         ).start()
-        self._status.definir("Treinando VGG16…")
+        nome_exibicao = "VGG16" if self._modelo_nome.get() == "vgg" else "DenseNet121"
+        self._status.definir(f"Treinando {nome_exibicao}…")
 
     def _parar(self):
         self._parar_flag.set()
@@ -1742,8 +1869,9 @@ class AbaClassificacao(ctk.CTkFrame):
         if not self._historico:
             return
         modo_str = "Binário" if self._modo.get() == "binario" else "4 Classes"
+        nome_exibicao = "VGG16" if self._modelo_nome.get() == "vgg" else "DenseNet121"
         img_pil = gerar_graficos_convergencia(
-            self._historico, titulo=f"VGG16 — {modo_str}"
+            self._historico, titulo=f"{nome_exibicao} — {modo_str}"
         )
         if img_pil is None:
             return
@@ -1854,7 +1982,9 @@ class AbaClassificacao(ctk.CTkFrame):
             # Salva gráfico em PNG ao lado do .pth
             if self._historico:
                 graf_path = caminho.replace(".pth", "_graficos.png")
-                img_pil = gerar_graficos_convergencia(self._historico)
+                nome_exibicao = "VGG16" if self._modelo_nome.get() == "vgg" else "DenseNet121"
+                modo_str = "Binário" if self._modo.get() == "binario" else "4 Classes"
+                img_pil = gerar_graficos_convergencia(self._historico, titulo=f"{nome_exibicao} — {modo_str}")
                 if img_pil:
                     img_pil.save(graf_path, dpi=(150, 150))
             messagebox.showinfo("Salvo", f"Modelo: {caminho}\nHistórico: {hist_path}")
@@ -2066,7 +2196,7 @@ class AbaGradCAM(ctk.CTkFrame):
             f"Classe predita: {rotulo}\n"
             f"Confiança: {confianca:.1%}\n"
             f"Modo: {'binário' if n_classes == 2 else '4 classes'}\n"
-            f"Camada alvo: features[28]"
+            f"Camada alvo: {self._grad_cam.nome_camada_alvo}"
         )
 
         self.after(
@@ -2139,7 +2269,7 @@ class AplicacaoMamografia(ctk.CTk):
         )
         ctk.CTkLabel(
             cabecalho,
-            text="Segmentação e Classificação Mamográfica · PUC Minas · VGG16",
+            text="Segmentação e Classificação Mamográfica · PUC Minas · VGG16 + DenseNet121",
             font=FONTE_PEQUENA,
         ).pack(side="left")
         lbl_device = ctk.CTkLabel(
