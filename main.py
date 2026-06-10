@@ -53,6 +53,34 @@ except ImportError:
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
+# =============================================================================
+# SISTEMA DE LOGGING — saída simultânea para terminal (stdout) e interface
+# =============================================================================
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+_logger = logging.getLogger("MamoVision")
+
+
+def log_info(msg: str):
+    """Emite log INFO no terminal e retorna a string formatada para a UI."""
+    _logger.info(msg)
+    return f"[INFO] {msg}"
+
+
+def log_warn(msg: str):
+    _logger.warning(msg)
+    return f"[WARN] {msg}"
+
+
+def log_erro(msg: str):
+    _logger.error(msg)
+    return f"[ERRO] {msg}"
+
 # ── Constantes de fonte ──────────────────────────────────────────────────────
 FONTE_TITULO = ("Helvetica", 16, "bold")
 FONTE_SECAO = ("Helvetica", 11, "bold")
@@ -325,6 +353,26 @@ def criar_dataloaders(
         )
     return train_loader, test_loader
 
+def desativar_relu_inplace(modulo: nn.Module) -> nn.Module:
+    """
+    Percorre recursivamente todos os submódulos e converte ReLU(inplace=True)
+    para ReLU(inplace=False).
+
+    Por que é necessário:
+    - VGG16 e DenseNet121 pré-treinados têm ReLU(inplace=True) em todo o backbone.
+    - O Grad-CAM registra um hook no tensor de saída de uma camada intermediária
+      via retain_grad() + register_hook().
+    - Quando um ReLU subsequente opera inplace sobre esse tensor (ou um view dele),
+      o PyTorch >= 2.0 detecta conflito com o BackwardHookFunctionBackward e lança
+      RuntimeError.
+    - Converter para inplace=False faz cada ReLU criar um novo tensor, eliminando
+      o conflito sem alterar os valores computados.
+    """
+    for nome, submodulo in modulo.named_modules():
+        if isinstance(submodulo, nn.ReLU) and submodulo.inplace:
+            submodulo.inplace = False
+    return modulo
+
 
 # =============================================================================
 # MODELO VGG16 — Transfer Learning
@@ -332,50 +380,25 @@ def criar_dataloaders(
 
 
 class ClassificadorVGG(nn.Module):
-    """
-    VGG16 com transfer learning para classificação BIRADS.
-
-    Arquitetura:
-    - Backbone: features VGG16 pré-treinadas (ImageNet), congeladas.
-    - AdaptiveAvgPool2d(7,7): garante entrada fixa ao classifier.
-    - Classifier substituído:
-        Linear(25088 → 512) → ReLU → Dropout(0.5) → Linear(512 → n_classes)
-
-    Por que congelar o backbone?
-    - O dataset mamográfico é pequeno; retreinar todas as camadas causaria
-      overfitting severo e destruiria os features ImageNet já aprendidos.
-    - As features de baixo nível (bordas, texturas) são transferíveis e
-      já suficientes para o problema; apenas o classificador final
-      precisa se adaptar à tarefa BIRADS.
-
-    Por que Dropout(0.5)?
-    - Regularização essencial dado o tamanho reduzido do dataset.
-    - p=0.5 é o valor canônico do artigo original do Dropout (Srivastava 2014)
-      e funciona bem como ponto de partida.
-
-    Parâmetros:
-    - n_classes: 2 (binário I+II vs III+IV) ou 4 (quadriclasse I×II×III×IV)
-    - dropout: taxa de dropout no classificador (padrão 0.5)
-    """
-
     def __init__(self, n_classes: int = 4, dropout: float = 0.5):
         super().__init__()
         base = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
 
-        # Congela todo o backbone (features conv)
         for param in base.features.parameters():
             param.requires_grad = False
 
-        self.features = base.features  # 13 camadas conv
-        self.avgpool = base.avgpool  # AdaptiveAvgPool2d(7,7)
+        self.features = base.features
+        self.avgpool = base.avgpool
 
-        # Substitui classifier: 25088 = 512 * 7 * 7
         self.classifier = nn.Sequential(
             nn.Linear(25088, 512),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),   # já corrigido na resposta anterior
             nn.Dropout(p=dropout),
             nn.Linear(512, n_classes),
         )
+
+        # Converte TODOS os ReLU inplace do backbone (VGG tem ~13 deles)
+        desativar_relu_inplace(self)
 
     def forward(self, x):
         x = self.features(x)
@@ -384,20 +407,6 @@ class ClassificadorVGG(nn.Module):
         return self.classifier(x)
 
     def descongelar_ultimas_conv(self, n_blocos: int = 1):
-        """
-        Descongela os últimos n_blocos de camadas conv do backbone.
-
-        Usado no fine-tuning parcial (Fase 3 dos experimentos):
-        após convergência do classifier, libera as camadas finais
-        para se adaptarem às texturas mamográficas específicas.
-
-        n_blocos=1 → desbloqueia apenas features[24:] (último bloco conv)
-        n_blocos=2 → desbloqueia features[17:] (2 últimos blocos)
-
-        Referência: Howard & Ruder (2018) — Universal Language Model Fine-Tuning
-        (ULMFiT), que popularizou o descongelamento gradual de camadas.
-        """
-        # Índices dos blocos VGG16: [0,4,9,14,19,24] (início de cada MaxPool)
         pontos_bloco = [0, 5, 10, 17, 24]
         idx = pontos_bloco[max(0, len(pontos_bloco) - n_blocos - 1)]
         for i, camada in enumerate(self.features):
@@ -412,80 +421,42 @@ class ClassificadorVGG(nn.Module):
 
 
 class ClassificadorDenseNet(nn.Module):
-    """
-    DenseNet121 com transfer learning para classificação BIRADS.
-
-    Arquitetura:
-    - Backbone: DenseNet121 pré-treinada no ImageNet, congelada inicialmente.
-    - Classifier substituído:
-        Linear(num_features → 512) → ReLU → Dropout → Linear(512 → n_classes)
-
-    Parâmetros:
-    - n_classes: 2 (binário I+II vs III+IV) ou 4 (quadriclasse I×II×III×IV)
-    - dropout: taxa de dropout no classificador final
-    """
-
     def __init__(self, n_classes: int = 4, dropout: float = 0.5):
         super().__init__()
-
-        # 1. Carrega a DenseNet121 com pesos pré-treinados no ImageNet
         base = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
 
-        # 2. Congela a parte convolucional para treinar primeiro só a cabeça nova
         for param in base.features.parameters():
             param.requires_grad = False
 
-        # 3. Guarda o backbone convolucional
         self.features = base.features
-
-        # 4. Captura o tamanho do vetor de características que sai da DenseNet
-        # Na DenseNet121, normalmente é 1024.
         num_features = base.classifier.in_features
 
-        # 5. Substitui a cabeça original de 1000 classes por uma cabeça BIRADS
         self.classifier = nn.Sequential(
             nn.Linear(num_features, 512),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),   # já corrigido na resposta anterior
             nn.Dropout(p=dropout),
             nn.Linear(512, n_classes),
         )
 
+        # DenseNet121 tem ReLU inplace espalhados por todos os dense blocks
+        desativar_relu_inplace(self)
+
     def forward(self, x):
-        # Passa a imagem pelas camadas convolucionais da DenseNet
         x = self.features(x)
-
-        # A DenseNet original aplica ReLU antes do pooling global
-        x = torch.relu(x)
-
-        # Pooling global: [batch, canais, altura, largura] → [batch, canais, 1, 1]
+        x = torch.relu(x)   # torch.relu não é inplace por padrão
         x = nn.functional.adaptive_avg_pool2d(x, (1, 1))
-
-        # Achata: [batch, canais, 1, 1] → [batch, canais]
         x = torch.flatten(x, 1)
-
-        # Classificador final: [batch, canais] → [batch, n_classes]
         return self.classifier(x)
 
     def descongelar_ultimas_conv(self, n_blocos: int = 1):
-        """
-        Descongela os últimos blocos da DenseNet para fine-tuning parcial.
-
-        n_blocos=0 → mantém tudo congelado
-        n_blocos=1 → descongela denseblock4 + norm5
-        n_blocos=2 → descongela denseblock3 + transition3 + denseblock4 + norm5
-        n_blocos=3 → descongela denseblock2 em diante
-        """
         if n_blocos <= 0:
             return
-
         blocos = [
             ["denseblock4", "norm5"],
             ["denseblock3", "transition3", "denseblock4", "norm5"],
             ["denseblock2", "transition2", "denseblock3", "transition3", "denseblock4", "norm5"],
         ]
-
         nomes_para_descongelar = blocos[min(n_blocos, 3) - 1]
-
         for nome, modulo in self.features.named_children():
             if nome in nomes_para_descongelar:
                 for param in modulo.parameters():
@@ -636,6 +607,13 @@ def treinar_modelo(
         otimizador, mode="min", factor=0.5, patience=3
     )
 
+    n_treino = len(train_loader.dataset) if train_loader else 0
+    n_teste = len(test_loader.dataset) if test_loader else 0
+    _logger.info(
+        f"Início do treinamento | modo={modo} | épocas={n_epocas} | "
+        f"lr={lr} | wd={weight_decay} | train={n_treino} | test={n_teste}"
+    )
+
     historico = {
         "train_loss": [],
         "val_loss": [],
@@ -756,11 +734,22 @@ def treinar_modelo(
         else:
             paciencia_atual += 1
             if paciencia_atual >= paciencia_max:
+                _logger.info(
+                    f"Early stopping acionado na época {epoca} "
+                    f"(sem melhora por {paciencia_max} épocas)"
+                )
                 if callback_epoca:
                     callback_epoca(
                         {**historico, "epoca": epoca, "status": "early_stop"}
                     )
                 break
+
+        _logger.info(
+            f"Época {epoca}/{n_epocas} | "
+            f"Loss={loss_tr:.4f}/{loss_val:.4f} | "
+            f"Acc={acc_tr:.3f}/{acc_val:.3f} | "
+            f"LR={lr_atual:.2e} | {tempo_ep:.1f}s"
+        )
 
         if callback_epoca:
             callback_epoca(
@@ -772,6 +761,21 @@ def treinar_modelo(
         modelo.load_state_dict(melhor_estado)
 
     historico["melhor_val_loss"] = round(melhor_val_loss, 4)
+
+    # Calcula melhor acurácia e melhor F1 para o resumo final
+    melhor_acc = max(historico["val_acc"]) if historico["val_acc"] else 0.0
+    melhor_f1 = max(historico["f1"]) if historico["f1"] else 0.0
+    tempo_total = sum(historico["tempo_por_epoca"])
+    historico["melhor_acc"] = round(melhor_acc, 4)
+    historico["melhor_f1"] = round(melhor_f1, 4)
+    historico["tempo_total"] = round(tempo_total, 2)
+
+    _logger.info(
+        f"Treinamento concluído | épocas={historico['epocas_rodadas']} | "
+        f"melhor val_acc={melhor_acc:.3f} | melhor F1={melhor_f1:.3f} | "
+        f"tempo total={tempo_total:.1f}s"
+    )
+
     if callback_fim:
         callback_fim(historico)
     return historico
@@ -1379,10 +1383,12 @@ class AbaDataset(ctk.CTkFrame):
         self._card_treino.definir(str(len(treino)))
         self._card_teste.definir(str(len(teste)))
         self._card_total.definir(str(len(todos_caminhos)))
-        self._registrar(f"Diretório: {diretorio}")
+        self._registrar(log_info(f"Dataset carregado: {diretorio}"))
         self._registrar(
-            f"Total: {len(todos_caminhos)} imagens | "
-            f"Treino: {len(treino)} | Teste: {len(teste)}"
+            log_info(
+                f"Total: {len(todos_caminhos)} imagens | "
+                f"Treino: {len(treino)} | Teste: {len(teste)}"
+            )
         )
         for letra, (idx, birads) in self.MAPA_CLASSE.items():
             self._registrar(
@@ -1401,7 +1407,7 @@ class AbaDataset(ctk.CTkFrame):
                 os.makedirs(
                     os.path.join(self._dir_processado, split, letra), exist_ok=True
                 )
-        self._log_ts("Iniciando processamento (segmentação + crop + resize)…")
+        self._log_ts(log_info("Iniciando processamento (segmentação + crop + resize)…"))
         self.after(0, lambda: self._status.definir("Processando imagens…"))
         for i, rec in enumerate(self._registros):
             caminho = rec["arquivo"]
@@ -1414,9 +1420,9 @@ class AbaDataset(ctk.CTkFrame):
                 img_proc = preparar_imagem(img)
                 img_proc.save(destino)
             except Exception as e:
-                self._log_ts(f"  [ERRO] {nome_arq}: {e}")
+                self._log_ts(log_erro(f"{nome_arq}: {e}"))
             if (i + 1) % 10 == 0 or (i + 1) == total:
-                self._log_ts(f"  Processadas: {i + 1}/{total}")
+                self._log_ts(log_info(f"Segmentação: {i + 1}/{total} imagens processadas"))
                 self.after(0, lambda v=(i + 1) / total: self._barra_aumento.set(v))
         if TORCH_OK:
             self._train_loader, self._test_loader = criar_dataloaders(
@@ -1424,9 +1430,9 @@ class AbaDataset(ctk.CTkFrame):
             )
             n_tr = len(self._train_loader.dataset) if self._train_loader else 0
             n_te = len(self._test_loader.dataset) if self._test_loader else 0
-            self._log_ts(f"DataLoaders: train={n_tr}, test={n_te}")
+            self._log_ts(log_info(f"DataLoaders criados: train={n_tr}, test={n_te}"))
         else:
-            self._log_ts("PyTorch não encontrado — DataLoaders não criados.")
+            self._log_ts(log_warn("PyTorch não encontrado — DataLoaders não criados."))
         self.after(
             0,
             lambda: (
@@ -1434,7 +1440,7 @@ class AbaDataset(ctk.CTkFrame):
                 self._status.definir("Processamento concluído."),
             ),
         )
-        self._log_ts(f"Estrutura salva em: {self._dir_processado}")
+        self._log_ts(log_info(f"Estrutura processada salva em: {self._dir_processado}"))
 
     def realizarAugmentacao(self):
         if not self._imgs_treino:
@@ -1464,9 +1470,16 @@ class AbaDataset(ctk.CTkFrame):
         total = len(registros_treino) * len(self.ANGULOS_AUG)
         feito = 0
         geradas = 0
+
+        # Contagem original antes do aumento
+        n_treino_original = len(registros_treino)
+
+        self._log_ts(log_info(
+            f"Aumento iniciado: {n_treino_original} imgs × "
+            f"{len(self.ANGULOS_AUG)} rotações = {total} arquivos esperados"
+        ))
         self._log_ts(
-            f"Aumento: {len(registros_treino)} imgs × "
-            f"{len(self.ANGULOS_AUG)} rotações = {total} arquivos"
+            f"  Dataset original — Treino: {n_treino_original} | Teste: {len(self._imgs_teste)}"
         )
         self.after(0, lambda: self._barra_aumento.set(0))
         self.after(0, lambda: self._status.definir("Realizando aumento…"))
@@ -1482,7 +1495,7 @@ class AbaDataset(ctk.CTkFrame):
                     else preparar_imagem(Image.open(rec["arquivo"]))
                 )
             except Exception as e:
-                self._log_ts(f"  [ERRO] {nome_arq}: {e}")
+                self._log_ts(log_erro(f"{nome_arq}: {e}"))
                 feito += len(self.ANGULOS_AUG)
                 continue
             for ang in self.ANGULOS_AUG:
@@ -1503,19 +1516,44 @@ class AbaDataset(ctk.CTkFrame):
                         self._lbl_aumento.configure(text=f"{d}/{t}"),
                     ),
                 )
-        self.after(
-            0,
-            lambda: (
-                self._registrar(f"Aumento concluído: {geradas} imagens geradas."),
-                self._status.definir("Aumento de dados concluído."),
-            ),
-        )
+
+        # Recria dataloaders e obtém contagem final
+        n_treino_apos = n_treino_original  # fallback
         if TORCH_OK and self._dir_processado:
             self._train_loader, self._test_loader = criar_dataloaders(
                 self._dir_processado
             )
-            n_tr = len(self._train_loader.dataset) if self._train_loader else 0
-            self._log_ts(f"DataLoaders recriados: train={n_tr} (com augmentation)")
+            n_treino_apos = len(self._train_loader.dataset) if self._train_loader else geradas
+            self._log_ts(log_info(f"DataLoaders recriados: train={n_treino_apos} (com augmentation)"))
+
+        # ITEM 1: exibir resumo claro antes/depois na interface e no terminal
+        resumo = (
+            f"\n{'='*45}\n"
+            f"  RESUMO DO DATASET APÓS AUGMENTATION\n"
+            f"{'='*45}\n"
+            f"  Dataset original:\n"
+            f"    Treino : {n_treino_original} imagens\n"
+            f"    Teste  : {len(self._imgs_teste)} imagens\n"
+            f"\n"
+            f"  Após augmentation:\n"
+            f"    Treino : {n_treino_apos} imagens\n"
+            f"    Teste  : {len(self._imgs_teste)} imagens (inalterado)\n"
+            f"    Geradas: {geradas} novas imagens\n"
+            f"{'='*45}"
+        )
+        self._log_ts(log_info(f"Augmentation concluída: {geradas} imagens geradas"))
+        _logger.info(resumo)  # imprime também no terminal
+
+        self.after(
+            0,
+            lambda: (
+                self._registrar(resumo),
+                self._card_treino.definir(f"{n_treino_apos}↑"),
+                self._status.definir(
+                    f"Augmentation concluída — treino: {n_treino_original}→{n_treino_apos}"
+                ),
+            ),
+        )
 
     # ── Propriedades acessíveis pelas outras abas ────────────────────────────
     @property
@@ -1659,13 +1697,22 @@ class AbaClassificacao(ctk.CTkFrame):
         botao(painel_esq, "⚡ Classificar Teste", self._classificar).pack(
             padx=12, fill="x"
         )
+        linha_salvar = ctk.CTkFrame(painel_esq, fg_color="transparent")
+        linha_salvar.pack(fill="x", padx=12, pady=4)
         botao(
-            painel_esq,
-            "💾 Salvar Modelo",
+            linha_salvar,
+            "💾 Salvar",
             self._salvar,
             fg_color="transparent",
             border_width=1,
-        ).pack(padx=12, pady=4, fill="x")
+        ).pack(side="left", expand=True, fill="x", padx=(0, 2))
+        botao(
+            linha_salvar,
+            "📂 Carregar",
+            self._carregar_modelo,
+            fg_color="transparent",
+            border_width=1,
+        ).pack(side="left", expand=True, fill="x", padx=(2, 0))
 
         # Progresso
         linha_prog = ctk.CTkFrame(painel_esq, fg_color="transparent")
@@ -1698,6 +1745,24 @@ class AbaClassificacao(ctk.CTkFrame):
             c.pack(side="left", expand=True, fill="both", padx=2)
             for c in self._cards_metrica
         ]
+
+        # ITEM 7: Cards de resumo do treinamento
+        rotulo_secao(painel_dir, "RESUMO DO TREINAMENTO")
+        linha_resumo = ctk.CTkFrame(painel_dir, fg_color="transparent")
+        linha_resumo.pack(fill="x", padx=12, pady=(0, 6))
+        self._card_treino_qtd = CartaoMetrica(linha_resumo, "Imgs Treino")
+        self._card_teste_qtd = CartaoMetrica(linha_resumo, "Imgs Teste")
+        self._card_tempo_total = CartaoMetrica(linha_resumo, "Tempo Total")
+        self._card_melhor_acc = CartaoMetrica(linha_resumo, "Melhor Acc")
+        self._card_melhor_f1 = CartaoMetrica(linha_resumo, "Melhor F1")
+        for c in (
+            self._card_treino_qtd,
+            self._card_teste_qtd,
+            self._card_tempo_total,
+            self._card_melhor_acc,
+            self._card_melhor_f1,
+        ):
+            c.pack(side="left", expand=True, fill="both", padx=2)
 
         # Abas internas: Matriz de Confusão | Gráficos
         self._abas_internas = ctk.CTkTabview(painel_dir)
@@ -1862,6 +1927,33 @@ class AbaClassificacao(ctk.CTkFrame):
         self._barra_treino.set(1.0)
         n_ep = self._historico.get("epocas_rodadas", 0)
         self._status.definir(f"Treino concluído — {n_ep} épocas.")
+
+        # ITEM 7: preenche cards de resumo
+        n_tr = (
+            len(self._aba_dataset.train_loader.dataset)
+            if self._aba_dataset.train_loader
+            else 0
+        )
+        n_te = (
+            len(self._aba_dataset.test_loader.dataset)
+            if self._aba_dataset.test_loader
+            else 0
+        )
+        tempo_total = self._historico.get("tempo_total", 0.0)
+        melhor_acc = self._historico.get("melhor_acc", 0.0)
+        melhor_f1 = self._historico.get("melhor_f1", 0.0)
+        self._card_treino_qtd.definir(str(n_tr))
+        self._card_teste_qtd.definir(str(n_te))
+        self._card_tempo_total.definir(f"{tempo_total:.1f}s")
+        self._card_melhor_acc.definir(f"{melhor_acc:.3f}")
+        self._card_melhor_f1.definir(f"{melhor_f1:.3f}")
+
+        _logger.info(
+            f"Treino concluído | épocas={n_ep} | imgs_treino={n_tr} | "
+            f"imgs_teste={n_te} | melhor_acc={melhor_acc:.3f} | "
+            f"melhor_f1={melhor_f1:.3f} | tempo_total={tempo_total:.1f}s"
+        )
+
         self._renderizar_graficos()
 
     def _renderizar_graficos(self):
@@ -1905,6 +1997,7 @@ class AbaClassificacao(ctk.CTkFrame):
 
     def _executar_classificacao(self):
         self.after(0, lambda: self._status.definir("Classificando conjunto de teste…"))
+        _logger.info("Classificação iniciada no conjunto de teste")
         t0 = time.time()
         modelo = self._modelo.to(DEVICE)
         modelo.eval()
@@ -1924,14 +2017,23 @@ class AbaClassificacao(ctk.CTkFrame):
         decorrido = time.time() - t0
 
         # Métricas binárias
+        # CORREÇÃO (Item 6): a mesma regra do treino — positivo = classes >= 2 (III+IV)
+        # Antes estava ">= 1" para modo quadriclasse, o que incluía erroneamente
+        # BI-RADS II (classe 1) como positivo, divergindo do critério de treino.
         met_bin = calcular_metricas_binario(
-            [1 if v >= 1 else 0 for v in y_true] if modo != "binario" else y_true,
-            [1 if v >= 1 else 0 for v in y_pred] if modo != "binario" else y_pred,
+            [1 if v >= 2 else 0 for v in y_true] if modo != "binario" else y_true,
+            [1 if v >= 2 else 0 for v in y_pred] if modo != "binario" else y_pred,
         )
 
         # Métricas 4 classes
         n_c = 2 if modo == "binario" else 4
         met4 = calcular_metricas_4classes(y_true, y_pred, n_classes=n_c)
+
+        _logger.info(
+            f"Classificação concluída | tempo={decorrido:.2f}s | "
+            f"acc={met_bin['acuracia']:.3f} | sensib={met_bin['sensibilidade']:.3f} | "
+            f"espec={met_bin['especificidade']:.3f} | F1={met_bin['f1']:.3f}"
+        )
 
         self.after(0, lambda: self._exibir_resultados(met_bin, met4, decorrido))
 
@@ -1975,6 +2077,7 @@ class AbaClassificacao(ctk.CTkFrame):
             return
         try:
             torch.save(self._modelo.state_dict(), caminho)
+            _logger.info(f"Modelo salvo: {caminho}")
             # Salva também o histórico em JSON ao lado do .pth
             hist_path = caminho.replace(".pth", "_historico.json")
             with open(hist_path, "w", encoding="utf-8") as f:
@@ -1996,6 +2099,91 @@ class AbaClassificacao(ctk.CTkFrame):
     @property
     def modelo(self):
         return self._modelo
+
+    # ── Carregar modelo treinado ──────────────────────────────────────────────
+
+    def _carregar_modelo(self):
+        """
+        ITEM 5: Carrega pesos de um arquivo .pth salvo previamente.
+
+        Fluxo:
+        1. Abre diálogo para selecionar o arquivo .pth
+        2. Detecta automaticamente a arquitetura e o número de classes
+           a partir das chaves do state_dict
+        3. Instancia o modelo correto (VGG ou DenseNet, 2 ou 4 classes)
+        4. Carrega os pesos com map_location (funciona em CPU e GPU)
+        5. Disponibiliza o modelo para classificação e Grad-CAM imediatamente
+        6. Tenta carregar histórico JSON correspondente (se existir)
+        """
+        if not TORCH_OK:
+            messagebox.showerror("Erro", "PyTorch não instalado.")
+            return
+        caminho = filedialog.askopenfilename(
+            filetypes=[("PyTorch weights", "*.pth"), ("Todos", "*.*")]
+        )
+        if not caminho:
+            return
+        try:
+            state = torch.load(caminho, map_location=DEVICE)
+
+            # ── Detecta arquitetura pelo formato das chaves do state_dict ──
+            chaves = list(state.keys())
+            # VGG: chaves começam com "features.0.weight" (índice inteiro)
+            # DenseNet: chaves começam com "features.conv0.weight"
+            eh_densenet = any("denseblock" in k or "conv0" in k for k in chaves)
+
+            # Detecta n_classes pelo tamanho da última camada do classifier
+            ultima_chave = [k for k in chaves if "classifier" in k and "weight" in k]
+            if ultima_chave:
+                n_classes = state[ultima_chave[-1]].shape[0]
+            else:
+                n_classes = 4  # fallback
+
+            # ── Instancia o modelo correto ─────────────────────────────────
+            if eh_densenet:
+                novo_modelo = ClassificadorDenseNet(n_classes=n_classes)
+                self._modelo_nome.set("densenet")
+            else:
+                novo_modelo = ClassificadorVGG(n_classes=n_classes)
+                self._modelo_nome.set("vgg")
+
+            novo_modelo.load_state_dict(state)
+            novo_modelo = novo_modelo.to(DEVICE)
+            novo_modelo.eval()
+            self._modelo = novo_modelo
+
+            # Sincroniza o seletor de modo com n_classes detectado
+            self._modo.set("binario" if n_classes == 2 else "quadriclasse")
+
+            arq_nome = os.path.basename(caminho)
+            tipo_str = "DenseNet121" if eh_densenet else "VGG16"
+            modo_str = "Binário (2 classes)" if n_classes == 2 else "4 Classes"
+            _logger.info(
+                f"Modelo carregado: {caminho} | arch={tipo_str} | classes={n_classes}"
+            )
+
+            # Tenta carregar histórico JSON correspondente
+            hist_path = caminho.replace(".pth", "_historico.json")
+            if os.path.isfile(hist_path):
+                with open(hist_path, "r", encoding="utf-8") as f:
+                    self._historico = json.load(f)
+                self._renderizar_graficos()
+                _logger.info(f"Histórico carregado: {hist_path}")
+
+            msg = (
+                f"Modelo carregado com sucesso.\n\n"
+                f"Arquivo : {arq_nome}\n"
+                f"Arquitetura : {tipo_str}\n"
+                f"Modo : {modo_str}\n\n"
+                f"Pronto para Classificar e Grad-CAM."
+            )
+            messagebox.showinfo("Modelo carregado", msg)
+            self._status.definir(
+                f"Modelo carregado: {arq_nome} ({tipo_str}, {modo_str})"
+            )
+        except Exception as e:
+            _logger.error(f"Erro ao carregar modelo: {e}")
+            messagebox.showerror("Erro ao carregar modelo", str(e))
 
 
 # =============================================================================
@@ -2153,6 +2341,7 @@ class AbaGradCAM(ctk.CTkFrame):
 
     def _executar_gradcam(self):
         self.after(0, lambda: self._status.definir("Gerando Grad-CAM…"))
+        _logger.info(f"Grad-CAM iniciado: {os.path.basename(self._caminho)}")
 
         modelo = self._aba_classif.modelo
         modelo = modelo.to(DEVICE).eval()
@@ -2211,6 +2400,7 @@ class AbaGradCAM(ctk.CTkFrame):
         self._card_classe.definir(rotulo)
         self._card_confianca.definir(f"{confianca:.1%}")
         self._atualizar_info(info)
+        _logger.info(f"Grad-CAM gerado | classe={rotulo} | confiança={confianca:.1%}")
         self._status.definir("Grad-CAM gerado.")
 
     def _salvar_resultado(self):
